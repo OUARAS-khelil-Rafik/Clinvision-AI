@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+env/
+.ipynb_checkpoints/
+
+# Data and generated artifacts
+data/raw/*
+!data/raw/.gitkeep
+data/cache_320/*
+!data/cache_320/.gitkeep
+data/metadata/*
+!data/metadata/.gitkeep
+models/*.keras
+models/*.h5
+artifacts/*
+!artifacts/.gitkeep
+
+# Secrets
+.env
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

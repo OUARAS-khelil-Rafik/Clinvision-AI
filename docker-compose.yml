@@ -1,0 +1,24 @@
+services:
+  api:
+    build: .
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_PATH: /app/models/clinvision_pneumonia.keras
+      MODEL_VERSION: clinvision-v2
+      MAX_UPLOAD_MB: 20
+    volumes:
+      - ./models:/app/models:ro
+      - ./artifacts:/app/artifacts
+
+  streamlit:
+    build: .
+    command: streamlit run frontend/app.py --server.address 0.0.0.0 --server.port 8501
+    ports:
+      - "8501:8501"
+    environment:
+      API_URL: http://api:8000
+      MAX_UPLOAD_MB: 20
+    depends_on:
+      - api

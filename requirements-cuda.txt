@@ -1,0 +1,4 @@
+# Use on Linux/WSL2 with a compatible NVIDIA driver.
+-r requirements.txt
+# TensorFlow official CUDA extra installs the matching NVIDIA Python runtime pieces.
+tensorflow[and-cuda]==2.18.1
