@@ -1,12 +1,14 @@
 # ClinVision AI — RSNA Pneumonia Detection
 
-> **Clinical Imaging Copilot — educational / hackathon MVP**
->
-> This repository implements the project described in the supplied RSNA/ClinVision AI implementation plan: DICOM/JPG/PNG upload, chest-X-ray preprocessing, DenseNet121 pneumonia classification, Grad-CAM explainability, clinical context, structured summary, FastAPI inference, Streamlit UI, and optional YOLO detection.
+> Clinical Imaging Copilot — educational / hackathon MVP
+
+ClinVision AI is a chest X-ray analysis workflow built around the RSNA Pneumonia Detection Challenge. The project combines DICOM-aware preprocessing, a DenseNet121 classifier, Grad-CAM explainability, structured clinical context, FastAPI inference, and a Streamlit frontend.
+
+This repository is intended as an engineering prototype and is not a medical device, autonomous diagnostic system, or clinical decision tool.
 
 ## 1. Project goal
 
-ClinVision AI is an AI-assisted workflow for chest radiography. The core MVP is:
+The core workflow is:
 
 ```text
 DICOM / JPG / PNG
@@ -26,42 +28,25 @@ Structured clinical summary
 FastAPI + Streamlit
 ```
 
-The system is **not a medical device and not an autonomous diagnostic system**. The probability and Grad-CAM are model outputs and require professional review.
+The model output should be interpreted alongside professional review and contextual clinical information.
 
-## 2. Source specification implemented
+## 2. What is implemented
 
-The supplied plan requires:
+The repository follows the supplied implementation plan and includes:
 
-- RSNA Pneumonia Detection Challenge data.
-- Patient-level splitting, not row-level splitting.
-- DICOM processing with `pydicom`.
-- Resize to 224×224 in the original plan; this implementation defaults to **320×320** as an accuracy-oriented extension while keeping the same DenseNet121 architecture.
-- DenseNet121 + GlobalAveragePooling2D + Dropout + sigmoid output.
-- Binary cross-entropy / Adam-family optimization.
-- AUC, precision, recall, accuracy, PR-AUC, specificity and confusion matrix.
-- Grad-CAM for explanation.
-- FastAPI endpoints `/health`, `/predict`, `/explain`, `/summary`, `/analyze`.
-- Streamlit upload + clinical context + probability + Grad-CAM + structured summary.
-- Optional YOLO extension only after the classification MVP is stable.
+- RSNA Pneumonia Detection Challenge dataset handling
+- patient-level train/validation/test splitting
+- DICOM preprocessing with `pydicom`
+- PNG cache generation for faster training
+- DenseNet121 backbone with GlobalAveragePooling2D, dropout, and sigmoid output
+- binary cross-entropy training with Adam-family optimization
+- AUC, PR-AUC, accuracy, precision, recall, specificity, F1, confusion matrix
+- Grad-CAM explainability
+- FastAPI endpoints for inference and reporting
+- Streamlit application with clinical context and image upload
+- optional YOLO detection as a separate future extension
 
-## 3. Why only one notebook?
-
-All data work, preprocessing, caching, model creation, training, fine-tuning, evaluation, Grad-CAM, threshold analysis and artifact generation are contained in:
-
-```text
-ClinVision_AI_RSNA.ipynb
-```
-
-The only Python application files are:
-
-```text
-backend/main.py      # FastAPI
-frontend/app.py      # Streamlit
-```
-
-This avoids the previous multi-script architecture and makes the complete ML workflow easy to execute in Jupyter or Colab.
-
-## 4. Final tree
+## 3. Repository structure
 
 ```text
 clinvision-ai/
@@ -76,7 +61,7 @@ clinvision-ai/
 │   └── metadata/            # generated CSV split metadata
 ├── models/
 │   ├── clinvision_pneumonia.keras
-│   └── ...                  # generated best checkpoints
+│   └── ...                  # checkpoints and generated artifacts
 ├── artifacts/               # plots, metrics, Grad-CAMs, reports
 ├── Dockerfile
 ├── docker-compose.yml
@@ -85,171 +70,36 @@ clinvision-ai/
 ├── requirements-mac.txt
 ├── .env.example
 ├── .gitignore
-└── README.md
+├── README.md
+└── .venv/                  # local environment (optional)
 ```
 
-The dataset, trained weights and generated cache are intentionally not committed.
+The dataset, trained weights, and generated cache are intentionally not checked into Git.
 
-## 5. Hardware: CUDA, Apple Silicon/Metal, or CPU
+## 4. Why only one notebook?
 
-The notebook detects the TensorFlow execution device automatically.
-
-### NVIDIA CUDA — Linux / WSL2
-
-TensorFlow's official pip guide documents the CUDA-enabled installation as:
-
-```bash
-python -m pip install "tensorflow[and-cuda]==2.18.1"
-```
-
-Then verify:
-
-```bash
-python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
-```
-
-A recent NVIDIA driver is required by the host. The notebook then reports the visible TensorFlow GPU.
-
-### Apple Silicon — M1/M2/M3/M4
-
-The project remains TensorFlow/Keras because that is the technology specified by the source plan. Apple currently provides a Metal plugin for TensorFlow acceleration; this is **not the same device API name as PyTorch `mps`**. TensorFlow sees the Metal-backed accelerator through its GPU device mechanism.
-
-Recommended environment:
-
-```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-pip install tensorflow-metal==1.2.0
-```
-
-Check:
-
-```bash
-python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
-```
-
-If the Metal plugin is unavailable, TensorFlow automatically falls back to CPU. Apple documentation describes Metal as the compute/ML acceleration layer for Apple GPUs; TensorFlow's own install page currently states that macOS GPU support is not official in core TensorFlow, so the Metal plugin should be treated as a platform-specific accelerator rather than a TensorFlow-native CUDA equivalent.
-
-### CPU
-
-```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-For CPU training, reduce `IMAGE_SIZE` or `BATCH_SIZE` in the notebook to fit your machine.
-
-## 6. Dataset
-
-Download the **RSNA Pneumonia Detection Challenge** dataset from Kaggle. The required files are:
-
-```text
-stage_2_train_images/
-stage_2_train_labels.csv
-stage_2_detailed_class_info.csv
-stage_2_sample_submission.csv
-```
-
-### Kaggle on Colab
-
-1. Create/download your Kaggle API token (`kaggle.json`).
-2. Upload it to Colab.
-3. Run the dataset setup cell in the notebook.
-
-The notebook never expects patient data to be committed to Git.
-
-## 7. Run the complete notebook
-
-Open:
+All training, preprocessing, cache generation, model creation, evaluation, Grad-CAM, threshold analysis, and artifact export are centralized in:
 
 ```text
 ClinVision_AI_RSNA.ipynb
 ```
 
-Execute cells in order.
-
-### Step 1 — Environment and device
-
-The notebook installs/checks dependencies and prints:
-
-- Python version
-- TensorFlow version
-- GPU devices
-- CPU fallback status
-- Apple Metal availability when relevant
-
-### Step 2 — Dataset discovery
-
-Place/extract the RSNA dataset under:
+The only runtime application files are:
 
 ```text
-clinvision-ai/data/raw/
+backend/main.py
+frontend/app.py
 ```
 
-The notebook locates the labels and image directory automatically.
+This keeps the project simple: the full ML workflow lives in one notebook while the serving layer remains lightweight and deployable.
 
-### Step 3 — Data audit
+## 5. Model and training profile
 
-The notebook calculates:
-
-- number of rows
-- unique patients
-- positive/negative patients
-- missing values
-- duplicate patient IDs
-- number of positive images with multiple boxes
-- invalid/corrupted files
-
-### Step 4 — Patient-level split
-
-The split is performed on a unique patient table. A patient never appears in two partitions.
-
-Default:
-
-```text
-Train      75%
-Validation 15%
-Test       10%
-```
-
-The test partition is an engineering extension beyond the original plan and remains untouched until final evaluation.
-
-### Step 5 — DICOM preprocessing and cache
-
-The notebook:
-
-1. reads DICOM with `pydicom`;
-2. applies available VOI LUT information when possible;
-3. applies modality rescale slope/intercept;
-4. handles `MONOCHROME1` polarity;
-5. robustly normalizes intensities using percentiles;
-6. resizes to `IMAGE_SIZE`;
-7. writes a compact normalized PNG cache.
-
-Caching is critical: it avoids calling `pydicom` for every training epoch, which was one of the main causes of the very long training times in the earlier pipeline.
-
-### Step 6 — tf.data pipeline
-
-The model reads cached PNGs directly through TensorFlow. Training augmentation is applied only to training data:
-
-- small rotation
-- small translation
-- small zoom
-- mild contrast variation
-
-**No horizontal flip is used by default**, preserving laterality information.
-
-### Step 7 — Accuracy-oriented DenseNet121
-
-The default training profile is designed for your stated goal of improving raw train/validation accuracy while still reporting medical metrics.
+This implementation keeps the DenseNet121 architecture while slightly extending the original pipeline for accuracy-focused training.
 
 ```text
 Input                320×320×3
-Backbone             DenseNet121 ImageNet
+Backbone             DenseNet121 (ImageNet pretrained)
 Pooling              GlobalAveragePooling2D
 Normalization        BatchNormalization
 Dropout              0.20
@@ -261,27 +111,162 @@ Fine-tune layers     80
 Class weighting      OFF by default for accuracy profile
 ```
 
-The `class_weight="balanced"` strategy used in the previous run is intentionally not the default here because it prioritizes minority-class sensitivity and can lower raw accuracy at threshold 0.5.
+Important notes:
 
-### Step 8 — Stage A
+- The dataset is split at the patient level, not at the image-row level.
+- Validation is used to select thresholds, and the test set remains untouched until final evaluation.
+- `class_weight="balanced"` is not the default here, since it can improve sensitivity but may reduce raw accuracy at a 0.5 decision threshold.
 
-Train the classifier head while DenseNet121 is frozen.
+## 6. Hardware support
 
-Callbacks:
+The notebook detects the active TensorFlow device automatically.
+
+### NVIDIA CUDA — Linux / WSL2
+
+```bash
+python -m pip install "tensorflow[and-cuda]==2.18.1"
+python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+```
+
+A compatible NVIDIA driver is required on the host machine.
+
+### Apple Silicon — M1/M2/M3/M4
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+pip install tensorflow-metal==1.2.0
+python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+```
+
+TensorFlow on Apple Silicon uses the Metal plugin, which is platform-specific and is not the same as the PyTorch `mps` API.
+
+### CPU
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+For CPU training, reduce `IMAGE_SIZE` or `BATCH_SIZE` as needed.
+
+## 7. Dataset
+
+Download the RSNA Pneumonia Detection Challenge dataset from Kaggle. Required files:
+
+```text
+stage_2_train_images/
+stage_2_train_labels.csv
+stage_2_detailed_class_info.csv
+stage_2_sample_submission.csv
+```
+
+Place the extracted dataset under:
+
+```text
+data/raw/
+```
+
+The notebook will discover the labels and DICOM directory automatically.
+
+## 8. Notebook workflow
+
+Open and run:
+
+```text
+ClinVision_AI_RSNA.ipynb
+```
+
+Execute the notebook cells in order.
+
+### Step 1 — Environment and device checks
+
+The notebook prints:
+
+- Python version
+- TensorFlow version
+- visible GPU devices
+- CPU fallback status
+- Apple Metal availability (if relevant)
+
+### Step 2 — Dataset discovery
+
+The notebook locates the extracted data and validates the expected files.
+
+### Step 3 — Data audit
+
+The notebook computes:
+
+- row counts
+- unique patient counts
+- positive/negative patient counts
+- missing values
+- duplicate patient identifiers
+- images with multiple positive boxes
+- invalid or corrupted files
+
+### Step 4 — Patient-level split
+
+The pipeline splits by patient to avoid leakage between partitions.
+
+Default split:
+
+```text
+Train      75%
+Validation 15%
+Test       10%
+```
+
+The test set remains untouched until the final evaluation stage.
+
+### Step 5 — DICOM preprocessing and cache
+
+The notebook:
+
+1. reads DICOM files using `pydicom`
+2. applies VOI LUT when available
+3. applies modality rescale slope/intercept
+4. handles `MONOCHROME1` polarity
+5. normalizes intensity values robustly using percentiles
+6. resizes to the configured `IMAGE_SIZE`
+7. writes compact normalized PNGs to the cache
+
+This avoids expensive DICOM decoding at every training step.
+
+### Step 6 — TensorFlow dataset pipeline
+
+The model consumes cached PNGs directly. Training augmentation is applied only to training data:
+
+- small rotation
+- small translation
+- small zoom
+- mild contrast variation
+
+Horizontal flipping is intentionally avoided to preserve laterality information.
+
+### Step 7 — Stage A training
+
+The classifier head is trained while the DenseNet121 backbone remains frozen.
+
+Callbacks include:
 
 - best validation accuracy checkpoint
 - best validation AUC checkpoint
-- ReduceLROnPlateau
-- EarlyStopping
+- `ReduceLROnPlateau`
+- `EarlyStopping`
 - CSV logger
 
-### Step 9 — Stage B
+### Step 8 — Stage B fine-tuning
 
-The last DenseNet layers are unfrozen and fine-tuned at a much smaller learning rate. Batch Normalization layers remain frozen for stability.
+The last DenseNet layers are unfrozen and fine-tuned with a lower learning rate. BatchNorm layers remain frozen for stability.
 
-### Step 10 — Evaluation
+### Step 9 — Evaluation
 
-The notebook computes:
+The notebook reports:
 
 - accuracy
 - ROC-AUC
@@ -295,38 +280,34 @@ The notebook computes:
 - ROC curve
 - precision-recall curve
 
-Two accuracy values are reported:
+Two accuracy forms are reported:
 
-1. **default 0.50 threshold** — the model's standard binary decision;
-2. **validation-selected threshold** — selected only on validation and then frozen for final test evaluation.
+1. Default 0.50 threshold
+2. Validation-selected threshold (frozen before final test evaluation)
 
-This prevents using the test set to tune the threshold.
+This avoids tuning the threshold on the test set.
 
-## 8. Important: reaching 90% accuracy
+## 9. Accuracy expectations
 
-The code is explicitly optimized toward higher accuracy, but **90% validation accuracy is not guaranteed**. It depends on the actual RSNA split, preprocessing, hardware, random seed and training convergence.
+The code is optimized for higher accuracy, but reaching 90% validation accuracy is not guaranteed. It depends on the split, preprocessing, hardware, random seed, and convergence behavior.
 
-More importantly, 90% accuracy by itself can be misleading on an imbalanced medical dataset. The notebook therefore reports recall, specificity, precision, ROC-AUC and PR-AUC next to accuracy.
+Accuracy alone is not enough for an imbalanced medical dataset. The notebook also reports recall, specificity, precision, ROC-AUC, and PR-AUC because a model that predicts almost everything as negative can look deceptively accurate.
 
-A model that reaches 90% accuracy by predicting almost everything as negative is not equivalent to a clinically useful classifier.
+## 10. Grad-CAM
 
-## 9. Grad-CAM
-
-Grad-CAM is generated from the final convolutional DenseNet feature tensor. It is presented as **model explainability**, not as a certified lesion localization method.
+Grad-CAM is generated from the final convolutional DenseNet feature map. It is included as explainability output rather than as a certification of lesion localization.
 
 The notebook generates:
 
-```text
-Original X-ray
-Grad-CAM heatmap
-Original + Grad-CAM overlay
-```
+- original X-ray
+- Grad-CAM heatmap
+- original + Grad-CAM overlay
 
 The Streamlit interface uses the same logic for uploaded images.
 
-## 10. API
+## 11. FastAPI backend
 
-Start FastAPI:
+Start the API:
 
 ```bash
 uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
@@ -349,15 +330,15 @@ curl -X POST http://localhost:8000/predict \
   -F "file=@sample.dcm"
 ```
 
-## 11. Streamlit
+## 12. Streamlit frontend
 
-Start the UI:
+Start the app:
 
 ```bash
 streamlit run frontend/app.py
 ```
 
-The application provides:
+The UI includes:
 
 - age
 - sex
@@ -366,27 +347,27 @@ The application provides:
 - DICOM/JPG/PNG upload
 - pneumonia probability
 - confidence visualization
-- Grad-CAM
+- Grad-CAM output
 - structured summary
 - safety notice
 
-## 12. Docker
+## 13. Docker deployment
 
-The default Docker image is CPU-compatible and intentionally keeps the deployment simple.
+The default Docker image is CPU-friendly and intentionally simple.
 
 ```bash
 docker compose build
 docker compose up
 ```
 
-Then:
+Access points:
 
 ```text
 Streamlit: http://localhost:8501
 FastAPI:   http://localhost:8000/docs
 ```
 
-The trained model must exist at:
+The trained model should exist at:
 
 ```text
 models/clinvision_pneumonia.keras
@@ -394,17 +375,17 @@ models/clinvision_pneumonia.keras
 
 and is mounted read-only into the containers.
 
-For NVIDIA CUDA training, use the notebook on a CUDA-capable host or Colab/Brev rather than forcing CUDA into the default lightweight serving image.
+For CUDA-based training, use a GPU-enabled host or Colab/Brev instead of trying to force CUDA into the default lightweight serving container.
 
-## 13. Secrets
+## 14. Secrets and environment
 
 Copy:
 
 ```text
-.env.example → .env
+.env.example -> .env
 ```
 
-Optional LLM settings:
+Optional LLM configuration:
 
 ```text
 LLM_BASE_URL=
@@ -412,51 +393,47 @@ LLM_API_KEY=
 LLM_MODEL=
 ```
 
-The application works without an LLM. In that case the `/summary` endpoint uses a deterministic template-based summary.
+The application works without an LLM. In that case, the summary endpoint uses a deterministic template-based summary.
 
 Never commit API keys or patient data.
 
-## 14. Production-minded behavior
+## 15. Production-minded behavior
 
 The application includes:
 
-- file-size limit
+- file size checks
 - content-type validation
-- DICOM/JPG/PNG handling
-- corrupted-file errors
-- model-file existence checks
+- DICOM / JPG / PNG handling
+- corrupted-file error handling
+- model-existence checks
 - model version in responses
 - request IDs
-- inference timing
+- timing metadata
 - optional SQLite demo history
-- deterministic fallback clinical summary
+- deterministic fallback summary
 - Grad-CAM failure isolation
 - JSON responses suitable for frontend integration
 
-## 15. Optional YOLO extension
+## 16. Optional YOLO extension
 
-The original plan proposes YOLO/Faster R-CNN as a later extension. This repository deliberately does not make detection part of the core inference path. The RSNA bounding-box annotations remain available in the notebook for exploration and for a future detector.
+The original plan proposes YOLO or Faster R-CNN as a later extension. This repository intentionally keeps detection out of the core inference path.
 
-A true detector should be trained and evaluated separately from Grad-CAM. Grad-CAM is not a substitute for bounding-box detection.
+A proper detector should be trained and evaluated separately from the classification model. Grad-CAM is explanatory only; it is not a substitute for bounding-box detection.
 
-## 16. Troubleshooting
+## 17. Troubleshooting
 
-### `Thumbs.db` or invalid DICOM/image files
+### Invalid DICOM or image files
 
-The notebook's cache builder validates every image and records failures in `artifacts/preprocess_errors.csv` instead of allowing one bad file to crash the entire TensorFlow pipeline.
+The cache builder validates each image and records failures in `artifacts/preprocess_errors.csv` instead of crashing the full TensorFlow pipeline.
 
 ### TensorFlow sees no GPU
-
-Run:
 
 ```python
 import tensorflow as tf
 print(tf.config.list_physical_devices('GPU'))
 ```
 
-For NVIDIA, verify `nvidia-smi` first.
-
-For Apple Silicon, install the compatible `tensorflow-metal` package in a native arm64 Python environment. TensorFlow core's macOS page currently describes macOS as CPU-only officially; Metal acceleration is provided by Apple's plugin ecosystem.
+For NVIDIA, verify `nvidia-smi` first. For Apple Silicon, install the correct `tensorflow-metal` package in a native arm64 environment.
 
 ### Out-of-memory
 
@@ -467,37 +444,38 @@ BATCH_SIZE = 4
 IMAGE_SIZE = 256
 ```
 
-before reducing the DenseNet capacity.
+before reducing DenseNet capacity.
 
 ### Training is too slow
 
-The cache architecture is intentionally designed to avoid decoding DICOMs inside every training step. If an epoch is still slow, benchmark:
+The cache architecture is designed to avoid DICOM decoding inside every training step. If training remains slow, benchmark:
 
 ```text
 storage → PNG decode → augmentation → GPU
 ```
 
-and use a local SSD rather than network storage.
+and prefer local SSD storage over network storage.
 
-## 17. Evaluation benchmark template
+## 18. Evaluation benchmark template
 
-After training, save the generated report from `artifacts/final_metrics.json` and record:
+After training, save the generated report from `artifacts/final_metrics.json` and record the results in your project log.
 
-| Split | Accuracy | ROC-AUC | PR-AUC | Precision | Recall | Specificity | F1 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Train | generated | generated | generated | generated | generated | generated | generated |
-| Validation | generated | generated | generated | generated | generated | generated | generated |
-| Test | generated | generated | generated | generated | generated | generated | generated |
+```text
+Split         Accuracy   ROC-AUC   PR-AUC   Precision   Recall   Specificity   F1
+Train         generated  generated  generated  generated  generated  generated  generated
+Validation    generated  generated  generated  generated  generated  generated  generated
+Test          generated  generated  generated  generated  generated  generated  generated
+```
 
-Do **not** insert fabricated benchmark numbers into the README.
+Do not insert fabricated benchmark numbers into the README.
 
-## 18. Scientific / clinical limitation
+## 19. Scientific and clinical limitations
 
-This repository is an engineering prototype based on the RSNA challenge dataset. Dataset performance cannot be interpreted as clinical validation, prospective validation, regulatory clearance, or diagnostic reliability in a real hospital population.
+This repository is an engineering prototype based on the RSNA Pneumonia Detection Challenge dataset. It does not constitute clinical validation, prospective validation, regulatory clearance, or guaranteed diagnostic reliability in a real hospital population.
 
-## 19. References
+## 20. References
 
 - RSNA Pneumonia Detection Challenge dataset: https://www.kaggle.com/competitions/rsna-pneumonia-detection-challenge/data
 - TensorFlow installation guide: https://www.tensorflow.org/install/pip
 - Apple Metal: https://developer.apple.com/metal/
-- Grad-CAM example: https://keras.io/examples/vision/grad_cam/
+- Keras Grad-CAM example: https://keras.io/examples/vision/grad_cam/
