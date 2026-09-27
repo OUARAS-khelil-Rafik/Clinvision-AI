@@ -1,481 +1,330 @@
 # ClinVision AI — RSNA Pneumonia Detection
 
-> Clinical Imaging Copilot — educational / hackathon MVP
+> Clinical Imaging Copilot — educational / hackathon prototype.
+> Chest X-ray pneumonia classification (DenseNet121) with DICOM-aware
+> preprocessing, Grad-CAM explainability, a doctor login portal, and
+> **free-LLM** clinical summaries.
 
-ClinVision AI is a chest X-ray analysis workflow built around the RSNA Pneumonia Detection Challenge. The project combines DICOM-aware preprocessing, a DenseNet121 classifier, Grad-CAM explainability, structured clinical context, FastAPI inference, and a Streamlit frontend.
+NOT A MEDICAL DEVICE. Predictions, Grad-CAM overlays and summaries are AI
+model outputs for educational purposes only. All clinical decisions must be
+made by qualified professionals. No real patient data should be stored in
+this demo (history keeps request id, class and probability only).
 
-This repository is intended as an engineering prototype and is not a medical device, autonomous diagnostic system, or clinical decision tool.
+## Table of contents
 
-## 1. Project goal
+1. [Quickstart](#1-quickstart)
+2. [Demo credentials](#2-demo-credentials)
+3. [What is implemented](#3-what-is-implemented)
+4. [How it works](#4-how-it-works)
+5. [Repository structure](#5-repository-structure)
+6. [Backend API reference](#6-backend-api-reference)
+7. [Frontend tour](#7-frontend-tour)
+8. [Configuration](#8-configuration)
+9. [Free LLM setup](#9-free-llm-setup)
+10. [Local run](#10-local-run)
+11. [Docker deployment](#11-docker-deployment)
+12. [Training notebook](#12-training-notebook)
+13. [Troubleshooting](#13-troubleshooting)
+14. [Limitations](#14-limitations)
+15. [References](#15-references)
 
-The core workflow is:
+## 1. Quickstart
 
-```text
-DICOM / JPG / PNG
-        ↓
-DICOM-aware preprocessing
-        ↓
-Cached 320×320 image
-        ↓
-DenseNet121 (ImageNet transfer learning)
-        ↓
-Pneumonia probability
-        ↓
-Grad-CAM explanation
-        ↓
-Structured clinical summary
-        ↓
-FastAPI + Streamlit
+```bash
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip && pip install -r requirements.txt
+cp .env.example .env
+
+# Terminal 1 — API
+uvicorn backend.main:app --host 0.0.0.0 --port 8000
+
+# Terminal 2 — UI
+API_URL=http://localhost:8000 streamlit run frontend/app.py
 ```
 
-The model output should be interpreted alongside professional review and contextual clinical information.
+Open `http://localhost:8501` and sign in (see credentials below).
+API docs: `http://localhost:8000/docs`. Health: `http://localhost:8000/health`.
 
-## 2. What is implemented
+Trained weights must exist at `models/clinvision_pneumonia.keras`
+(see [Training notebook](#12-training-notebook)).
 
-The repository follows the supplied implementation plan and includes:
+## 2. Demo credentials
 
-- RSNA Pneumonia Detection Challenge dataset handling
-- patient-level train/validation/test splitting
-- DICOM preprocessing with `pydicom`
-- PNG cache generation for faster training
-- DenseNet121 backbone with GlobalAveragePooling2D, dropout, and sigmoid output
-- binary cross-entropy training with Adam-family optimization
-- AUC, PR-AUC, accuracy, precision, recall, specificity, F1, confusion matrix
-- Grad-CAM explainability
-- FastAPI endpoints for inference and reporting
-- Streamlit application with clinical context and image upload
-- optional YOLO detection as a separate future extension
+| Role   | Username | Password    |
+|--------|----------|-------------|
+| Doctor | `doctor` | `doctor123` |
 
-## 3. Repository structure
+Used by the Streamlit login and `POST /auth/login`. Change via
+`DOCTOR_USERNAME` / `DOCTOR_PASSWORD` in `.env`. The UI also offers an
+offline demo mode (local credential check) when the API is unreachable;
+inference itself always requires the API.
+
+## 3. What is implemented
+
+- RSNA Pneumonia Detection Challenge dataset handling (notebook)
+- Patient-level train/validation/test splitting (no leakage)
+- DICOM preprocessing with `pydicom` (modality rescale + VOI LUT,
+  `MONOCHROME1` polarity, percentile normalisation, 320x320 resize)
+- DenseNet121 classifier (ImageNet transfer learning, sigmoid output)
+- Full evaluation: accuracy, ROC-AUC, PR-AUC, precision, recall,
+  specificity, F1, confusion matrix, threshold sweep
+- Grad-CAM explainability (final dense block), failure-isolated so it can
+  never break the prediction itself
+- FastAPI service: request ids, timing metadata, file-size limits, typed
+  errors, startup model preload, SQLite demo history
+- Doctor login (bearer tokens, 12 h TTL) + token-gated history endpoints
+- Streamlit doctor portal: stepper flow, preview, probability gauge with
+  risk band, Grad-CAM view, clinical summary, TXT/JSON report export,
+  session + server history
+- Free-LLM summary chain (Ollama local, Groq, Gemini, Hugging Face, custom
+  endpoint) with deterministic template fallback — the app runs with no
+  LLM configured at all
+
+## 4. How it works
 
 ```text
-clinvision-ai/
-├── ClinVision_AI_RSNA.ipynb
+DICOM / JPG / PNG (<= MAX_UPLOAD_MB)
+        |
+DICOM-aware preprocessing -> 320x320 gray -> RGB replicate (0-255 px)
+        |
+DenseNet121 -> pneumonia probability (threshold 0.5)
+        |
+Grad-CAM overlay (failure-isolated)
+        |
+Structured summary -> optional free-LLM rewrite
+        |
+FastAPI (JSON) -> Streamlit doctor portal
+```
+
+Clinical context (age/sex/symptoms) is display-only for the summary; it is
+never fed to the vision model.
+
+## 5. Repository structure
+
+```text
+clinvision-ai-final/
+├── ClinVision_AI_RSNA.ipynb   # full ML workflow (single source of truth)
 ├── backend/
-│   └── main.py
+│   └── main.py                # FastAPI: inference, auth, history, free LLM
 ├── frontend/
-│   └── app.py
+│   └── app.py                 # Streamlit doctor portal (login + analysis UI)
 ├── data/
-│   ├── raw/                 # Kaggle ZIP / extracted DICOMs
-│   ├── cache_320/           # generated resized PNG cache
-│   └── metadata/            # generated CSV split metadata
+│   ├── raw/                   # Kaggle DICOMs + CSVs (not in git)
+│   ├── cache_320/             # generated resized PNG cache
+│   └── metadata/              # generated split CSVs
 ├── models/
-│   ├── clinvision_pneumonia.keras
-│   └── ...                  # checkpoints and generated artifacts
-├── artifacts/               # plots, metrics, Grad-CAMs, reports
-├── Dockerfile
-├── docker-compose.yml
-├── requirements.txt
-├── requirements-cuda.txt
-├── requirements-mac.txt
-├── .env.example
-├── .gitignore
-├── README.md
-└── .venv/                  # local environment (optional)
+│   └── clinvision_pneumonia.keras   # trained weights (not in git)
+├── artifacts/                 # metrics, plots, Grad-CAMs, history.sqlite3
+├── Dockerfile                 # CPU serving image (API + UI)
+├── docker-compose.yml         # api + streamlit services
+├── requirements.txt           # base deps (TF 2.18.1, CPU)
+├── requirements-cuda.txt      # NVIDIA training variant
+├── requirements-mac.txt       # Apple Silicon (adds tensorflow-metal)
+├── .env.example               # all settings documented
+├── SOURCE_REQUIREMENTS.md
+└── README.md
 ```
 
-The dataset, trained weights, and generated cache are intentionally not checked into Git.
+Dataset, trained weights and PNG cache are intentionally not committed.
 
-## 4. Why only one notebook?
+## 6. Backend API reference
 
-All training, preprocessing, cache generation, model creation, evaluation, Grad-CAM, threshold analysis, and artifact export are centralized in:
+Start: `uvicorn backend.main:app --host 0.0.0.0 --port 8000`
 
-```text
-ClinVision_AI_RSNA.ipynb
-```
+| Method | Endpoint            | Auth* | Description                                   |
+|--------|---------------------|-------|-----------------------------------------------|
+| GET    | `/`                 | no    | Service info + endpoint list                  |
+| GET    | `/health`           | no    | Model/device/LLM status (`ok` / `degraded`)   |
+| GET    | `/llm/status`       | no    | Which free-LLM backends are configured        |
+| POST   | `/auth/login`       | no    | Doctor login (form) returns bearer token      |
+| POST   | `/auth/login/json`  | no    | Doctor login (JSON) returns bearer token      |
+| GET    | `/auth/verify`      | token | Check current token                           |
+| POST   | `/predict`          | †     | Probability only (multipart `file`)           |
+| POST   | `/explain`          | †     | Probability + Grad-CAM PNG (base64)           |
+| POST   | `/summary`          | †     | Summary for a probability + context (form)    |
+| POST   | `/analyze`          | †     | All-in-one: prediction + Grad-CAM + summary   |
+| GET    | `/history?limit=50` | †     | Recent demo predictions                       |
+| DELETE | `/history`          | †     | Clear demo history                            |
 
-The only runtime application files are:
+\* Token = `Authorization: Bearer <token>` from `/auth/login`.
+† Required only when `REQUIRE_AUTH=true` (default `false`, so existing
+scripts keep working; the Streamlit UI always enforces its own login).
 
-```text
-backend/main.py
-frontend/app.py
-```
-
-This keeps the project simple: the full ML workflow lives in one notebook while the serving layer remains lightweight and deployable.
-
-## 5. Model and training profile
-
-This implementation keeps the DenseNet121 architecture while slightly extending the original pipeline for accuracy-focused training.
-
-```text
-Input                320×320×3
-Backbone             DenseNet121 (ImageNet pretrained)
-Pooling              GlobalAveragePooling2D
-Normalization        BatchNormalization
-Dropout              0.20
-Output               Dense(1, sigmoid)
-Optimizer            AdamW
-Initial LR           3e-4
-Fine-tune LR         5e-6
-Fine-tune layers     80
-Class weighting      OFF by default for accuracy profile
-```
-
-Important notes:
-
-- The dataset is split at the patient level, not at the image-row level.
-- Validation is used to select thresholds, and the test set remains untouched until final evaluation.
-- `class_weight="balanced"` is not the default here, since it can improve sensitivity but may reduce raw accuracy at a 0.5 decision threshold.
-
-## 6. Hardware support
-
-The notebook detects the active TensorFlow device automatically.
-
-### NVIDIA CUDA — Linux / WSL2
+Examples:
 
 ```bash
-python -m pip install "tensorflow[and-cuda]==2.18.1"
-python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+# Login (JSON)
+curl -X POST localhost:8000/auth/login/json \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"doctor","password":"doctor123"}'
+
+# Full analysis (prediction + Grad-CAM + summary)
+curl -X POST localhost:8000/analyze \
+  -F "file=@sample.png" -F "age=58" -F "sex=Male" -F "symptoms=cough, fever"
+
+# Probability + Grad-CAM only
+curl -X POST localhost:8000/explain -F "file=@sample.dcm"
+
+# Summary for a known probability
+curl -X POST localhost:8000/summary -F "probability=0.82" -F "symptoms=cough"
 ```
 
-A compatible NVIDIA driver is required on the host machine.
+Error contract: `400` empty/oversize upload or bad probability, `401` bad
+credentials (or missing token when `REQUIRE_AUTH=true`), `413` file over
+`MAX_UPLOAD_MB`, `422` undecodable image / inference failure, `500`
+unexpected.
 
-### Apple Silicon — M1/M2/M3/M4
+## 7. Frontend tour
+
+Start: `streamlit run frontend/app.py` → `http://localhost:8501`
+
+1. **Doctor Sign In** — username/password form in a centered card; shows an
+   API status pill; falls back to offline demo mode if the API is down.
+2. **Analyze tab** — 3-step flow with a stepper header (Upload → Analyze →
+   Review): file upload with preview + size, context confirmation pulled
+   from the sidebar, **Analyze image** with staged progress. Results show a
+   risk-band pill, native metrics, a Plotly probability gauge,
+   request/model metadata, Grad-CAM with PNG download, clinical summary
+   with LLM-source badge, expandable structured details + limitations, and
+   TXT/JSON report export.
+3. **History tab** — this-session table plus cached server history with a
+   refresh button and a confirm-gated clear button (`DELETE /history`).
+4. **About tab** — pipeline recap and the Ollama one-liner.
+
+Sidebar: clinical context (age checkbox so "unknown" is explicit, sex,
+symptoms, context), session info (API URL, upload limit, active free-LLM
+backends), status refresh and clear actions. Health/history calls are
+cached (15 s / 30 s) to keep the UI responsive.
+
+## 8. Configuration
+
+Copy `.env.example` → `.env`:
+
+| Variable               | Default                                  | Purpose                              |
+|------------------------|------------------------------------------|--------------------------------------|
+| `MODEL_PATH`           | `models/clinvision_pneumonia.keras`      | Weights file (repo-root relative)    |
+| `MODEL_VERSION`        | `clinvision-v2`                          | Version string in responses          |
+| `API_URL`              | `http://localhost:8000`                  | Backend URL for Streamlit            |
+| `MAX_UPLOAD_MB`        | `20`                                     | Upload size limit                    |
+| `LOG_LEVEL`            | `INFO`                                   | `DEBUG` / `INFO` / `WARNING` …       |
+| `DOCTOR_USERNAME`      | `doctor`                                 | Portal + API login                   |
+| `DOCTOR_PASSWORD`      | `doctor123`                              | Portal + API login                   |
+| `REQUIRE_AUTH`         | `false`                                  | `true` forces tokens on inference    |
+| `AUTH_TOKEN_TTL_HOURS` | `12`                                     | Bearer token lifetime                |
+| `OLLAMA_BASE_URL`      | `http://localhost:11434`                 | Free local LLM                       |
+| `OLLAMA_MODEL`         | `llama3.2`                               | Ollama model name                    |
+| `OLLAMA_TIMEOUT_S`     | `60`                                     | Ollama request timeout               |
+| `GROQ_API_KEY/MODEL`   | — / `llama-3.3-70b-versatile`            | Groq free tier                       |
+| `GEMINI_API_KEY/MODEL` | — / `gemini-2.0-flash`                   | Gemini free tier                     |
+| `HF_API_KEY/MODEL`     | — / `mistralai/Mistral-7B-Instruct-v0.3` | HF serverless free tier              |
+| `LLM_BASE_URL/API_KEY/MODEL` | —                                | Legacy custom OpenAI-compatible endpoint |
+
+Never commit API keys or patient data (`.env` is git-ignored).
+
+## 9. Free LLM setup
+
+The summary chain tries providers in order and always falls back to the
+deterministic template — **no LLM is required to run the app**. Check active
+backends at `GET /llm/status` or in the sidebar.
+
+**Recommended — Ollama (local, fully free, no key):**
 
 ```bash
-python3.11 -m venv .venv
+brew install ollama
+ollama serve &           # one terminal
+ollama pull llama3.2     # one-time download (~2 GB)
+```
+
+Keep `OLLAMA_BASE_URL=http://localhost:11434` and `OLLAMA_MODEL=llama3.2`
+in `.env`. Alternatives: free `GROQ_API_KEY` (console.groq.com),
+`GEMINI_API_KEY` (aistudio.google.com), `HF_API_KEY` (huggingface.co).
+
+Safety design: temperature 0, "use only supplied fields" prompting, no
+invented symptoms/diagnoses/treatments, and the output always states it is
+an AI model output requiring professional review.
+
+## 10. Local run
+
+```bash
 source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-pip install tensorflow-metal==1.2.0
-python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+uvicorn backend.main:app --host 0.0.0.0 --port 8000          # API
+API_URL=http://localhost:8000 streamlit run frontend/app.py  # UI
 ```
 
-TensorFlow on Apple Silicon uses the Metal plugin, which is platform-specific and is not the same as the PyTorch `mps` API.
-
-### CPU
-
-```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-For CPU training, reduce `IMAGE_SIZE` or `BATCH_SIZE` as needed.
-
-## 7. Dataset
-
-Download the RSNA Pneumonia Detection Challenge dataset from Kaggle. Required files:
-
-```text
-stage_2_train_images/
-stage_2_train_labels.csv
-stage_2_detailed_class_info.csv
-stage_2_sample_submission.csv
-```
-
-Place the extracted dataset under:
-
-```text
-data/raw/
-```
-
-The notebook will discover the labels and DICOM directory automatically.
-
-## 8. Notebook workflow
-
-Open and run:
-
-```text
-ClinVision_AI_RSNA.ipynb
-```
-
-Execute the notebook cells in order.
-
-### Step 1 — Environment and device checks
-
-The notebook prints:
-
-- Python version
-- TensorFlow version
-- visible GPU devices
-- CPU fallback status
-- Apple Metal availability (if relevant)
-
-### Step 2 — Dataset discovery
-
-The notebook locates the extracted data and validates the expected files.
-
-### Step 3 — Data audit
-
-The notebook computes:
-
-- row counts
-- unique patient counts
-- positive/negative patient counts
-- missing values
-- duplicate patient identifiers
-- images with multiple positive boxes
-- invalid or corrupted files
-
-### Step 4 — Patient-level split
-
-The pipeline splits by patient to avoid leakage between partitions.
-
-Default split:
-
-```text
-Train      75%
-Validation 15%
-Test       10%
-```
-
-The test set remains untouched until the final evaluation stage.
-
-### Step 5 — DICOM preprocessing and cache
-
-The notebook:
-
-1. reads DICOM files using `pydicom`
-2. applies VOI LUT when available
-3. applies modality rescale slope/intercept
-4. handles `MONOCHROME1` polarity
-5. normalizes intensity values robustly using percentiles
-6. resizes to the configured `IMAGE_SIZE`
-7. writes compact normalized PNGs to the cache
-
-This avoids expensive DICOM decoding at every training step.
-
-### Step 6 — TensorFlow dataset pipeline
-
-The model consumes cached PNGs directly. Training augmentation is applied only to training data:
-
-- small rotation
-- small translation
-- small zoom
-- mild contrast variation
-
-Horizontal flipping is intentionally avoided to preserve laterality information.
-
-### Step 7 — Stage A training
-
-The classifier head is trained while the DenseNet121 backbone remains frozen.
-
-Callbacks include:
-
-- best validation accuracy checkpoint
-- best validation AUC checkpoint
-- `ReduceLROnPlateau`
-- `EarlyStopping`
-- CSV logger
-
-### Step 8 — Stage B fine-tuning
-
-The last DenseNet layers are unfrozen and fine-tuned with a lower learning rate. BatchNorm layers remain frozen for stability.
-
-### Step 9 — Evaluation
-
-The notebook reports:
-
-- accuracy
-- ROC-AUC
-- PR-AUC
-- precision
-- recall / sensitivity
-- specificity
-- F1
-- confusion matrix
-- threshold sweep
-- ROC curve
-- precision-recall curve
-
-Two accuracy forms are reported:
-
-1. Default 0.50 threshold
-2. Validation-selected threshold (frozen before final test evaluation)
-
-This avoids tuning the threshold on the test set.
-
-## 9. Accuracy expectations
-
-The code is optimized for higher accuracy, but reaching 90% validation accuracy is not guaranteed. It depends on the split, preprocessing, hardware, random seed, and convergence behavior.
-
-Accuracy alone is not enough for an imbalanced medical dataset. The notebook also reports recall, specificity, precision, ROC-AUC, and PR-AUC because a model that predicts almost everything as negative can look deceptively accurate.
-
-## 10. Grad-CAM
-
-Grad-CAM is generated from the final convolutional DenseNet feature map. It is included as explainability output rather than as a certification of lesion localization.
-
-The notebook generates:
-
-- original X-ray
-- Grad-CAM heatmap
-- original + Grad-CAM overlay
-
-The Streamlit interface uses the same logic for uploaded images.
-
-## 11. FastAPI backend
-
-Start the API:
-
-```bash
-uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-Endpoints:
-
-```text
-GET  /health
-POST /predict
-POST /explain
-POST /summary
-POST /analyze
-```
-
-Example:
-
-```bash
-curl -X POST http://localhost:8000/predict \
-  -F "file=@sample.dcm"
-```
-
-## 12. Streamlit frontend
-
-Start the app:
-
-```bash
-streamlit run frontend/app.py
-```
-
-The UI includes:
-
-- age
-- sex
-- symptoms
-- clinical context
-- DICOM/JPG/PNG upload
-- pneumonia probability
-- confidence visualization
-- Grad-CAM output
-- structured summary
-- safety notice
-
-## 13. Docker deployment
-
-The default Docker image is CPU-friendly and intentionally simple.
+Hardware notes:
+
+- **NVIDIA CUDA (Linux/WSL2):** install `requirements-cuda.txt`, verify with
+  `nvidia-smi` then `tf.config.list_physical_devices('GPU')`.
+- **Apple Silicon (M1–M4):** `pip install -r requirements-mac.txt` (adds
+  `tensorflow-metal`) in a native arm64 Python 3.11 venv.
+- **CPU:** base `requirements.txt` works; reduce `BATCH_SIZE`/`IMAGE_SIZE`
+  in the notebook if memory is tight.
+
+## 11. Docker deployment
 
 ```bash
 docker compose build
 docker compose up
 ```
 
-Access points:
+| Service   | URL                            |
+|-----------|--------------------------------|
+| Streamlit | `http://localhost:8501`        |
+| FastAPI   | `http://localhost:8000/docs`   |
 
-```text
-Streamlit: http://localhost:8501
-FastAPI:   http://localhost:8000/docs
-```
+The image is CPU-based (`python:3.11-slim` + OpenGL libs for OpenCV).
+`./models` is mounted read-only, `./artifacts` read-write. For Ollama on
+the host, point the API at `OLLAMA_BASE_URL=http://host.docker.internal:11434`.
+For GPU training use a CUDA host or Colab, not this serving image.
 
-The trained model should exist at:
+## 12. Training notebook
 
-```text
-models/clinvision_pneumonia.keras
-```
+All ML lives in `ClinVision_AI_RSNA.ipynb` (run cells in order):
 
-and is mounted read-only into the containers.
+1. Environment + device checks (Python, TF version, GPU/Metal/CPU).
+2. Dataset discovery under `data/raw/` (`stage_2_train_images/`,
+   `stage_2_train_labels.csv`, `stage_2_detailed_class_info.csv`).
+3. Data audit (patients, positives/negatives, missing/duplicates, bad files).
+4. Patient-level split (default 75/15/10; test untouched until final eval).
+5. DICOM preprocessing → PNG cache in `data/cache_320/`.
+6. TF pipeline (train-only augmentation: rotation/translation/zoom/contrast;
+   no horizontal flip, to preserve laterality).
+7. Stage A: train head, backbone frozen (val-accuracy + val-AUC checkpoints,
+   ReduceLROnPlateau, EarlyStopping).
+8. Stage B: fine-tune last 80 layers at low LR, BatchNorm frozen.
+9. Evaluation: accuracy @0.5 and @validation-selected threshold, ROC-AUC,
+   PR-AUC, precision, recall, specificity, F1, confusion matrix, curves.
 
-For CUDA-based training, use a GPU-enabled host or Colab/Brev instead of trying to force CUDA into the default lightweight serving container.
+Model profile: input 320×320×3, DenseNet121 (ImageNet) + GAP + BatchNorm +
+Dropout 0.20 + Dense(1, sigmoid), AdamW (3e-4 head / 5e-6 fine-tune).
+Reaching 90% validation accuracy is not guaranteed — always read recall,
+specificity and AUC alongside accuracy on this imbalanced task.
 
-## 14. Secrets and environment
+## 13. Troubleshooting
 
-Copy:
+| Symptom | Fix |
+|---------|-----|
+| `/health` shows `degraded` | `MODEL_PATH` wrong or `.keras` missing — train notebook or restore file |
+| Streamlit "API unreachable" | API not running, wrong `API_URL` (Docker: `http://api:8000`), or port clash (`lsof -i :8000`) |
+| Login fails | Check `DOCTOR_USERNAME`/`DOCTOR_PASSWORD`; expired token → log in again |
+| `422` on upload | File corrupt/unsupported (DCM/JPG/PNG only) or under 32 px |
+| `413` on upload | Over `MAX_UPLOAD_MB`; raise limit or compress |
+| Template summary instead of LLM | No backend reachable — check `GET /llm/status`, `ollama serve`, model pulled |
+| TF sees no GPU (NVIDIA) | Check `nvidia-smi` first, then the CUDA TF install |
+| TF sees no GPU (Mac) | Native arm64 venv + `tensorflow-metal==1.2.0` |
+| OOM in training | Lower `BATCH_SIZE` (e.g. 4) / `IMAGE_SIZE` (e.g. 256), prefer local SSD |
 
-```text
-.env.example -> .env
-```
+## 14. Limitations
 
-Optional LLM configuration:
+Engineering prototype on the RSNA Pneumonia Detection Challenge data: no
+clinical/prospective validation, no regulatory clearance, no guaranteed
+reliability on real hospital populations. Grad-CAM is explanatory, not a
+validated lesion localiser. Do not use as a standalone diagnostic system.
 
-```text
-LLM_BASE_URL=
-LLM_API_KEY=
-LLM_MODEL=
-```
+## 15. References
 
-The application works without an LLM. In that case, the summary endpoint uses a deterministic template-based summary.
-
-Never commit API keys or patient data.
-
-## 15. Production-minded behavior
-
-The application includes:
-
-- file size checks
-- content-type validation
-- DICOM / JPG / PNG handling
-- corrupted-file error handling
-- model-existence checks
-- model version in responses
-- request IDs
-- timing metadata
-- optional SQLite demo history
-- deterministic fallback summary
-- Grad-CAM failure isolation
-- JSON responses suitable for frontend integration
-
-## 16. Optional YOLO extension
-
-The original plan proposes YOLO or Faster R-CNN as a later extension. This repository intentionally keeps detection out of the core inference path.
-
-A proper detector should be trained and evaluated separately from the classification model. Grad-CAM is explanatory only; it is not a substitute for bounding-box detection.
-
-## 17. Troubleshooting
-
-### Invalid DICOM or image files
-
-The cache builder validates each image and records failures in `artifacts/preprocess_errors.csv` instead of crashing the full TensorFlow pipeline.
-
-### TensorFlow sees no GPU
-
-```python
-import tensorflow as tf
-print(tf.config.list_physical_devices('GPU'))
-```
-
-For NVIDIA, verify `nvidia-smi` first. For Apple Silicon, install the correct `tensorflow-metal` package in a native arm64 environment.
-
-### Out-of-memory
-
-Reduce:
-
-```python
-BATCH_SIZE = 4
-IMAGE_SIZE = 256
-```
-
-before reducing DenseNet capacity.
-
-### Training is too slow
-
-The cache architecture is designed to avoid DICOM decoding inside every training step. If training remains slow, benchmark:
-
-```text
-storage → PNG decode → augmentation → GPU
-```
-
-and prefer local SSD storage over network storage.
-
-## 18. Evaluation benchmark template
-
-After training, save the generated report from `artifacts/final_metrics.json` and record the results in your project log.
-
-```text
-Split         Accuracy   ROC-AUC   PR-AUC   Precision   Recall   Specificity   F1
-Train         generated  generated  generated  generated  generated  generated  generated
-Validation    generated  generated  generated  generated  generated  generated  generated
-Test          generated  generated  generated  generated  generated  generated  generated
-```
-
-Do not insert fabricated benchmark numbers into the README.
-
-## 19. Scientific and clinical limitations
-
-This repository is an engineering prototype based on the RSNA Pneumonia Detection Challenge dataset. It does not constitute clinical validation, prospective validation, regulatory clearance, or guaranteed diagnostic reliability in a real hospital population.
-
-## 20. References
-
-- RSNA Pneumonia Detection Challenge dataset: https://www.kaggle.com/competitions/rsna-pneumonia-detection-challenge/data
-- TensorFlow installation guide: https://www.tensorflow.org/install/pip
+- RSNA Pneumonia Detection Challenge: https://www.kaggle.com/competitions/rsna-pneumonia-detection-challenge/data
+- TensorFlow pip install: https://www.tensorflow.org/install/pip
 - Apple Metal: https://developer.apple.com/metal/
 - Keras Grad-CAM example: https://keras.io/examples/vision/grad_cam/
+
