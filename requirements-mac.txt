@@ -1,3 +1,0 @@
--r requirements.txt
-# Apple Silicon TensorFlow GPU acceleration through Apple's Metal plugin ecosystem.
-tensorflow-metal==1.2.0
