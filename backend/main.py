@@ -73,9 +73,29 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("clinvision-api")
 
-# --- Doctor login (demo credentials, overridable via .env) -------------------
+# --- Doctor login (demo accounts, overridable via .env) ----------------------
+# Single account (legacy): DOCTOR_USERNAME / DOCTOR_PASSWORD.
+# Multiple accounts: DOCTOR_USERS="doctor:doctor123,resident:resident123".
+# Both sources are merged into USER_DB below (explicit pairs win).
 DOCTOR_USERNAME = os.getenv("DOCTOR_USERNAME", "doctor")
 DOCTOR_PASSWORD = os.getenv("DOCTOR_PASSWORD", "doctor123")
+
+
+def _load_user_db() -> dict[str, str]:
+    """Build the username -> password map from DOCTOR_USERS + legacy vars."""
+    users: dict[str, str] = {}
+    if DOCTOR_USERNAME:
+        users[DOCTOR_USERNAME.strip()] = DOCTOR_PASSWORD
+    for pair in os.getenv("DOCTOR_USERS", "").split(","):
+        if ":" in pair:
+            name, _, secret = pair.partition(":")
+            name, secret = name.strip(), secret.strip()
+            if name and secret:
+                users[name] = secret
+    return users
+
+
+USER_DB = _load_user_db()
 REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "false").strip().lower() in {"1", "true", "yes"}
 AUTH_TOKEN_TTL_SECONDS = int(os.getenv("AUTH_TOKEN_TTL_HOURS", "12")) * 3600
 
@@ -102,7 +122,7 @@ LLM_MODEL = os.getenv("LLM_MODEL", "").strip()
 # S1. Model lifecycle - lazy singleton + startup preload
 # -----------------------------------------------------------------------------
 MODEL = None
-_TOKENS: dict[str, float] = {}  # token -> expiry epoch
+_TOKENS: dict[str, tuple[str, float]] = {}  # token -> (username, expiry epoch)
 
 
 def get_model() -> tf.keras.Model:
@@ -167,15 +187,19 @@ class LoginRequest(BaseModel):
     password: str = ""
 
 
-def _password_ok(candidate: str) -> bool:
-    """Constant-time password comparison against DOCTOR_PASSWORD."""
-    return hmac.compare_digest(candidate or "", DOCTOR_PASSWORD)
+def _verify_credentials(username: str, password: str) -> Optional[str]:
+    """Validate against USER_DB; returns the canonical username or None."""
+    name = (username or "").strip()
+    expected = USER_DB.get(name, "")
+    if expected and hmac.compare_digest(password or "", expected):
+        return name
+    return None
 
 
 def _issue_token(username: str) -> dict:
-    """Mint a random bearer token with TTL; returns the login response dict."""
+    """Mint a random bearer token bound to `username`; returns login response."""
     token = secrets.token_urlsafe(32)
-    _TOKENS[token] = time.time() + AUTH_TOKEN_TTL_SECONDS
+    _TOKENS[token] = (username, time.time() + AUTH_TOKEN_TTL_SECONDS)
     return {
         "access_token": token,
         "token_type": "bearer",
@@ -184,23 +208,24 @@ def _issue_token(username: str) -> dict:
     }
 
 
-def _token_valid(token: str) -> bool:
-    """Check the in-memory token store; lazily evict expired tokens."""
-    expiry = _TOKENS.get(token or "")
-    if not expiry:
-        return False
+def _token_user(token: str) -> Optional[str]:
+    """Resolve a bearer token to its username; lazily evict expired tokens."""
+    entry = _TOKENS.get(token or "")
+    if not entry:
+        return None
+    username, expiry = entry
     if expiry < time.time():
         _TOKENS.pop(token, None)
-        return False
-    return True
+        return None
+    return username
 
 
 async def get_current_user(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
 ) -> Optional[str]:
     """Return username when a valid bearer token is supplied, else None."""
-    if creds and creds.credentials and _token_valid(creds.credentials):
-        return DOCTOR_USERNAME
+    if creds and creds.credentials:
+        return _token_user(creds.credentials)
     return None
 
 
@@ -231,16 +256,18 @@ async def login(
     if not username and not password:
         # This branch is reached via JSON only when using the raw endpoint below.
         pass
-    if username == DOCTOR_USERNAME and _password_ok(password):
-        return JSONResponse(_issue_token(username))
+    verified = _verify_credentials(username, password)
+    if verified:
+        return JSONResponse(_issue_token(verified))
     raise HTTPException(status_code=401, detail="Invalid username or password.")
 
 
 @app.post("/auth/login/json")
 async def login_json(body: LoginRequest) -> JSONResponse:
     """Doctor login via JSON body; returns a bearer token on success."""
-    if (body.username or "").strip() == DOCTOR_USERNAME and _password_ok(body.password):
-        return JSONResponse(_issue_token(DOCTOR_USERNAME))
+    verified = _verify_credentials(body.username, body.password)
+    if verified:
+        return JSONResponse(_issue_token(verified))
     raise HTTPException(status_code=401, detail="Invalid username or password.")
 
 

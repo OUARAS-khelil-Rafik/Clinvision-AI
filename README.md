@@ -35,6 +35,11 @@ demo context was entered).
 
 ## 1. Quickstart
 
+Needs: Python 3.11, Git. Works on **macOS, Linux and Windows**
+(plus Docker, see §12).
+
+**macOS / Linux** (`bash`/`zsh`):
+
 ```bash
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install --upgrade pip && pip install -r requirements.txt
@@ -47,6 +52,23 @@ uvicorn backend.main:app --host 0.0.0.0 --port 8000
 API_URL=http://localhost:8000 streamlit run frontend/app.py
 ```
 
+**Windows** (PowerShell):
+
+```powershell
+py -3.11 -m venv .venv; .\.venv\Scripts\Activate.ps1
+pip install --upgrade pip; pip install -r requirements.txt
+copy .env.example .env
+
+# Terminal 1 — API
+uvicorn backend.main:app --host 0.0.0.0 --port 8000
+
+# Terminal 2 — UI
+$env:API_URL="http://localhost:8000"; streamlit run frontend/app.py
+```
+
+> Windows `cmd.exe` variant: activate with `.venv\Scripts\activate.bat` and
+> set the variable with `set API_URL=http://localhost:8000`.
+
 Open `http://localhost:8501` and sign in (see credentials below), or click a
 demo sample to start immediately. API docs: `http://localhost:8000/docs`.
 Health: `http://localhost:8000/health`.
@@ -56,12 +78,15 @@ Trained weights must exist at `models/clinvision_pneumonia.keras`
 
 ## 2. Demo credentials
 
-| Role   | Username | Password    |
-|--------|----------|-------------|
-| Doctor | `doctor` | `doctor123` |
+| Role     | Username   | Password      |
+|----------|------------|---------------|
+| Doctor   | `doctor`   | `doctor123`   |
+| Resident | `resident` | `resident123` |
 
-Used by the Streamlit login and `POST /auth/login`. Change via
-`DOCTOR_USERNAME` / `DOCTOR_PASSWORD` in `.env`. The UI also offers an
+Used by the Streamlit login and `POST /auth/login`. The login screen never
+displays credentials — accounts live only in `.env` / `.env.example`
+(`DOCTOR_USERNAME` / `DOCTOR_PASSWORD` for the default account,
+`DOCTOR_USERS="user:pass,..."` for extra ones). The UI also offers an
 offline demo mode (local credential check) when the API is unreachable;
 inference itself always requires the API.
 
@@ -148,7 +173,6 @@ clinvision-ai-final/
 ├── docker-compose.yml         # api + streamlit services
 ├── requirements.txt           # single commented requirements file
 ├── .env.example               # all settings documented
-├── SOURCE_REQUIREMENTS.md
 └── README.md
 ```
 
@@ -247,8 +271,9 @@ Copy `.env.example` → `.env`:
 | `API_URL`              | `http://localhost:8000`                  | Backend URL for Streamlit            |
 | `MAX_UPLOAD_MB`        | `20`                                     | Upload size limit (also `.streamlit`)| 
 | `LOG_LEVEL`            | `INFO`                                   | `DEBUG` / `INFO` / `WARNING` …       |
-| `DOCTOR_USERNAME`      | `doctor`                                 | Portal + API login                   |
-| `DOCTOR_PASSWORD`      | `doctor123`                              | Portal + API login                   |
+| `DOCTOR_USERNAME`      | `doctor`                                 | Default account login                |
+| `DOCTOR_PASSWORD`      | `doctor123`                              | Default account password             |
+| `DOCTOR_USERS`         | `resident:resident123`                   | Extra `user:pass,...` accounts       |
 | `REQUIRE_AUTH`         | `false`                                  | `true` forces tokens on inference    |
 | `AUTH_TOKEN_TTL_HOURS` | `12`                                     | Bearer token lifetime                |
 | `OLLAMA_BASE_URL`      | `http://localhost:11434`                 | Free local LLM                       |
@@ -269,10 +294,14 @@ backends at `GET /llm/status` or in the sidebar.
 
 **Recommended — Ollama (local, fully free, no key):**
 
+| OS | Install | Then (all OS) |
+|----|---------|---------------|
+| macOS | `brew install ollama` | `ollama serve` (one terminal) |
+| Linux | `curl -fsSL https://ollama.com/install.sh \| sh` | `ollama serve` (usually auto-started as a service) |
+| Windows | `winget install Ollama.Ollama` (or the installer from ollama.com) | runs automatically in the background |
+
 ```bash
-brew install ollama
-ollama serve &           # one terminal
-ollama pull llama3.2     # one-time download (~2 GB)
+ollama pull llama3.2     # one-time download (~2 GB), all OS
 ```
 
 Keep `OLLAMA_BASE_URL=http://localhost:11434` and `OLLAMA_MODEL=llama3.2`
@@ -288,21 +317,33 @@ with teal headings (graceful fallback to raw text for the template).
 ## 11. Local run
 
 ```bash
+# macOS / Linux
 source .venv/bin/activate
 uvicorn backend.main:app --host 0.0.0.0 --port 8000          # API
 API_URL=http://localhost:8000 streamlit run frontend/app.py  # UI
 ```
 
+```powershell
+# Windows (PowerShell, venv already activated)
+uvicorn backend.main:app --host 0.0.0.0 --port 8000          # API
+$env:API_URL="http://localhost:8000"; streamlit run frontend/app.py  # UI
+```
+
 Hardware notes:
 
-- **NVIDIA CUDA (Linux/WSL2):** `pip install "tensorflow[and-cuda]==2.18.1`,
+- **Windows:** base `requirements.txt` installs and runs as-is (CPU).
+  For NVIDIA GPU training use **WSL2** and follow the Linux CUDA notes.
+- **Linux + NVIDIA CUDA:** `pip install "tensorflow[and-cuda]==2.18.1`,
   verify with `nvidia-smi` then `tf.config.list_physical_devices('GPU')`.
-- **Apple Silicon (M1–M4):** `pip install tensorflow-metal==1.2.0` in a
-  native arm64 Python 3.11 venv.
-- **CPU:** base `requirements.txt` works; reduce `BATCH_SIZE`/`IMAGE_SIZE`
-  in the notebook if memory is tight.
+- **macOS Apple Silicon (M1–M4):** `pip install tensorflow-metal==1.2.0`
+  in a native arm64 Python 3.11 venv.
+- **CPU (any OS):** base `requirements.txt` works; reduce `BATCH_SIZE` /
+  `IMAGE_SIZE` in the notebook if memory is tight.
 
 ## 12. Docker deployment
+
+Same commands on macOS, Linux and Windows (Docker Desktop with the WSL2
+backend on Windows):
 
 ```bash
 docker compose build
@@ -350,7 +391,7 @@ on this imbalanced task.
 | Symptom | Fix |
 |---------|-----|
 | `/health` shows `degraded` | `MODEL_PATH` wrong or `.keras` missing — train notebook or restore file |
-| Streamlit "API unreachable" | API not running, wrong `API_URL` (Docker: `http://api:8000`), or port clash (`lsof -i :8000`) |
+| Streamlit "API unreachable" | API not running, wrong `API_URL` (Docker: `http://api:8000`), or port clash (macOS/Linux: `lsof -i :8000` · Windows PowerShell: `netstat -ano \| findstr :8000`) |
 | Login fails | Check `DOCTOR_USERNAME`/`DOCTOR_PASSWORD`; expired token → log in again |
 | `422` on upload | File corrupt/unsupported (DCM/JPG/PNG only) or under 32 px |
 | `413` on upload | Over `MAX_UPLOAD_MB`; raise limit in `.env`, compose AND `.streamlit/config.toml` |

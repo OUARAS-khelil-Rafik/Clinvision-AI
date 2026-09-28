@@ -88,9 +88,23 @@ def _asset_data_uri(filename: str) -> str:
 
 
 LOGO_MARK_URI = _asset_data_uri("logo-mark-white.png")  # heroes are dark
-# Local fallback so the demo login works even if the API is briefly down.
-LOCAL_USER = os.getenv("DOCTOR_USERNAME", "doctor")
-LOCAL_PASS = os.getenv("DOCTOR_PASSWORD", "doctor123")
+
+
+def local_users() -> dict[str, str]:
+    """Offline credential map, mirroring the backend (DOCTOR_USERS + legacy).
+
+    Lets the demo login survive a brief API outage for any configured account.
+    """
+    users: dict[str, str] = {}
+    legacy_user = os.getenv("DOCTOR_USERNAME", "doctor")
+    if legacy_user:
+        users[legacy_user.strip()] = os.getenv("DOCTOR_PASSWORD", "doctor123")
+    for pair in os.getenv("DOCTOR_USERS", "").split(","):
+        if ":" in pair:
+            name, _, secret = pair.partition(":")
+            if name.strip() and secret.strip():
+                users[name.strip()] = secret.strip()
+    return users
 
 # -----------------------------------------------------------------------------
 # F0. Icon system - single source of truth (Material Symbols, Streamlit-native).
@@ -157,7 +171,6 @@ _LIGHT_VARS = """:root{
   --cv-bad-bg:#fdecea; --cv-bad-ink:#c0392b; --cv-bad-bd:#f5c6c0;
   --cv-llm-bg:#eef2ff; --cv-llm-ink:#3b5bdb; --cv-llm-bd:#cdd8ff;
   --cv-warn-bg:#fff8e6; --cv-warn-bd:#f0d48a; --cv-warn-bar:#e6a800; --cv-warn-ink:#7a5b00;
-  --cv-hint-bg:#f0f7fd; --cv-hint-bd:#9cc3e3; --cv-hint-ink:#0b3d5f;
   --cv-footer:#7d99b0;
 }"""
 _DARK_VARS = """:root{
@@ -171,7 +184,6 @@ _DARK_VARS = """:root{
   --cv-bad-bg:#2c1512; --cv-bad-ink:#f2a49c; --cv-bad-bd:#7c2d24;
   --cv-llm-bg:#1a2140; --cv-llm-ink:#aebfff; --cv-llm-bd:#35448f;
   --cv-warn-bg:#2a2111; --cv-warn-bd:#8a6d1f; --cv-warn-bar:#e6a800; --cv-warn-ink:#f0d48a;
-  --cv-hint-bg:#12283f; --cv-hint-bd:#2c5a86; --cv-hint-ink:#cfe6f7;
   --cv-footer:#8fa6bc;
 }"""
 _THEME_BODY = """
@@ -263,10 +275,6 @@ button[kind="primary"] {
   border-left: 4px solid var(--cv-warn-bar);
   border-radius: 12px; padding: 10px 16px; font-size: .85rem; color: var(--cv-warn-ink);
   margin: .6rem 0 1rem;
-}
-.hint-box {
-  background: var(--cv-hint-bg); border: 1px dashed var(--cv-hint-bd); border-radius: 10px;
-  padding: 10px 12px; font-size: .82rem; color: var(--cv-hint-ink); margin-top: 12px;
 }
 .footer { text-align: center; color: var(--cv-footer); font-size: .78rem; margin: 22px 0 8px; }
 /* Sidebar/clinical text frames: fixed size, internal scrollbar - never resizable. */
@@ -638,7 +646,8 @@ def do_login(username: str, password: str) -> tuple[bool, str]:
     except requests.RequestException:
         pass
     # 3) Offline fallback - API unreachable, check local demo credentials
-    if username == LOCAL_USER and password == LOCAL_PASS:
+    expected = local_users().get(username, "")
+    if expected and password == expected:
         st.session_state.authenticated = True
         st.session_state.token = None
         st.session_state.username = username
@@ -1028,57 +1037,67 @@ def evidence_panel(original_png: bytes | None, gradcam_raw: bytes | None,
 
 
 # -----------------------------------------------------------------------------
-# F5. Login screen - centered doctor sign-in; stops the script when logged out
+# F5. Login screen - one render function per block; the gate at the bottom
+# stops unauthenticated runs. No credentials are ever displayed here: demo
+# accounts live in .env / .env.example and are documented in README.md.
 # -----------------------------------------------------------------------------
+def render_login_hero() -> None:
+    """Brand banner above the sign-in card."""
+    st.markdown(
+        f"""<div class="hero" style="text-align:center">
+        <img class="hero-logo-center" src="{LOGO_MARK_URI}" alt="ClinVision-AI logo">
+        <div class="badge">CLINICAL IMAGING COPILOT</div>
+        <h1>ClinVision AI</h1>
+        <p>RSNA pneumonia detection · Grad-CAM · free-LLM summary</p>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_login_card() -> None:
+    """Sign-in form: validates input, delegates to do_login(), reruns on success."""
+    login_brand_mark()
+    st.markdown("<h3 style='text-align:center;margin:0'>Doctor Sign In</h3>",
+                unsafe_allow_html=True)
+    st.caption("Restricted to authorized clinicians.")
+    with st.form("login_form", clear_on_submit=False):
+        username = st.text_input(f"{ic('user')} Username", placeholder="doctor",
+                                 autocomplete="username")
+        password = st.text_input(f"{ic('key')} Password", type="password",
+                                 placeholder="••••••••",
+                                 autocomplete="current-password")
+        submit = st.form_submit_button(f"{ic('login')} Sign in", type="primary",
+                                       use_container_width=True)
+    if not submit:
+        return
+    if not username or not password:
+        st.error("Please enter both username and password.")
+        return
+    ok, msg = do_login(username, password)
+    if ok:
+        st.success(msg)
+        st.rerun()
+    else:
+        st.error(msg)
+
+
+def render_login_status() -> None:
+    """API health pill + safety disclaimer under the sign-in card."""
+    st.markdown(health_pill(fetch_health(API_URL)), unsafe_allow_html=True)
+    st.markdown(
+        """<div class="disclaimer"><b>Safety first.</b> Predictions and Grad-CAM
+        are model outputs - never a standalone diagnosis.</div>""",
+        unsafe_allow_html=True,
+    )
+
+
 if not st.session_state.authenticated:
     _, mid, _ = st.columns([1, 1.35, 1])
     with mid:
-        st.markdown(
-            f"""<div class="hero" style="text-align:center">
-            <img class="hero-logo-center" src="{LOGO_MARK_URI}" alt="ClinVision-AI logo">
-            <div class="badge">CLINICAL IMAGING COPILOT</div>
-            <h1>ClinVision AI</h1>
-            <p>RSNA pneumonia detection · Grad-CAM · free-LLM summary</p>
-            </div>""",
-            unsafe_allow_html=True,
-        )
+        render_login_hero()
         with st.container(border=True):
-            login_brand_mark()
-            st.markdown("<h3 style='text-align:center;margin:0'>Doctor Sign In</h3>",
-                        unsafe_allow_html=True)
-            st.caption("Restricted to authorized clinicians.")
-            with st.form("login_form", clear_on_submit=False):
-                username = st.text_input(f"{ic('user')} Username", placeholder="doctor",
-                                         autocomplete="username")
-                password = st.text_input(f"{ic('key')} Password", type="password",
-                                         placeholder="••••••••",
-                                         autocomplete="current-password")
-                submit = st.form_submit_button(f"{ic('login')} Sign in", type="primary",
-                                               use_container_width=True)
-            if submit:
-                if not username or not password:
-                    st.error("Please enter both username and password.")
-                else:
-                    ok, msg = do_login(username, password)
-                    if ok:
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.error(msg)
-            st.markdown(
-                f"""<div class="hint-box"><b>Demo credentials</b><br>
-                Username: <code>{LOCAL_USER}</code><br>
-                Password: <code>{LOCAL_PASS}</code><br>
-                <span style="opacity:.75">Change them in <code>.env</code> via
-                <code>DOCTOR_USERNAME</code> / <code>DOCTOR_PASSWORD</code>.</span></div>""",
-                unsafe_allow_html=True,
-            )
-        st.markdown(health_pill(fetch_health(API_URL)), unsafe_allow_html=True)
-        st.markdown(
-            """<div class="disclaimer"><b>Safety first.</b> Predictions and Grad-CAM
-            are model outputs - never a standalone diagnosis.</div>""",
-            unsafe_allow_html=True,
-        )
+            render_login_card()
+        render_login_status()
     st.markdown('<div class="footer">ClinVision AI · educational prototype · not a medical device</div>',
                 unsafe_allow_html=True)
     st.stop()
@@ -1637,9 +1656,11 @@ with tab_about:
                     "Clinical context never overrides the image model.")
     with st.container(border=True):
         st.subheader(f"{ic('llm')} Free LLM options (no paid key needed)")
-        st.code("brew install ollama && ollama serve && ollama pull llama3.2",
-                language="bash")
-        st.caption("Then set `OLLAMA_BASE_URL=http://localhost:11434` and "
+        st.code("ollama serve && ollama pull llama3.2", language="bash")
+        st.caption("Install Ollama first for your OS (macOS: `brew install ollama` · "
+                   "Linux: `curl -fsSL https://ollama.com/install.sh | sh` · "
+                   "Windows: `winget install Ollama.Ollama`). Then set "
+                   "`OLLAMA_BASE_URL=http://localhost:11434` and "
                    "`OLLAMA_MODEL=llama3.2`. Alternatives (free tiers): "
                    "Groq (`GROQ_API_KEY`), Gemini (`GEMINI_API_KEY`), "
                    "Hugging Face (`HF_API_KEY`). Without any of these the API safely "
