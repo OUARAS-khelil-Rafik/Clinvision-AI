@@ -1,5 +1,7 @@
 # ClinVision AI — RSNA Pneumonia Detection
 
+![ClinVision-AI logo](frontend/assets/logo-mark-navy.png)
+
 > Clinical Imaging Copilot — educational / hackathon prototype.
 > Chest X-ray pneumonia classification (DenseNet121) with DICOM-aware
 > preprocessing, Grad-CAM explainability, a doctor login portal, a 5-sample

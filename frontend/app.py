@@ -71,6 +71,23 @@ MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
 # Curated demo subset (data/demo/*.dcm + manifest.json). Optional: the whole
 # gallery hides itself when the folder is absent (e.g. minimal installs).
 DEMO_DIR = APP_ROOT / "data" / "demo"
+# Brand assets (ClinVision-AI logo set, derived from Logo ClinVision-AI/).
+ASSETS_DIR = APP_ROOT / "frontend" / "assets"
+LOGO_MARK_WHITE = str(ASSETS_DIR / "logo-mark-white.png")  # dark surfaces
+LOGO_MARK_NAVY = str(ASSETS_DIR / "logo-mark-navy.png")    # light surfaces
+LOGO_FAVICON = str(ASSETS_DIR / "favicon.png")             # browser tab
+
+
+def _asset_data_uri(filename: str) -> str:
+    """Embed a small asset as a data URI (raw-HTML blocks can't load files)."""
+    try:
+        raw = (ASSETS_DIR / filename).read_bytes()
+        return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+    except Exception:
+        return ""
+
+
+LOGO_MARK_URI = _asset_data_uri("logo-mark-white.png")  # heroes are dark
 # Local fallback so the demo login works even if the API is briefly down.
 LOCAL_USER = os.getenv("DOCTOR_USERNAME", "doctor")
 LOCAL_PASS = os.getenv("DOCTOR_PASSWORD", "doctor123")
@@ -121,7 +138,7 @@ def ic(name: str) -> str:
 
 st.set_page_config(
     page_title="ClinVision AI - Doctor Portal",
-    page_icon="🩻",
+    page_icon=LOGO_FAVICON if Path(LOGO_FAVICON).is_file() else "🩻",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -190,6 +207,10 @@ div[data-testid="stMarkdownContainer"] h3 { color: var(--cv-ink); }
   padding: 3px 12px; border-radius: 999px;
   font-size: .72rem; font-weight: 700; letter-spacing: .06em; margin-bottom: 10px;
 }
+/* Brand lockup inside the dark hero (white artwork) */
+.hero-flex { display: flex; align-items: center; gap: 18px; }
+.hero-logo { width: 76px; height: auto; flex-shrink: 0; }
+.hero-logo-center { display: block; margin: 0 auto 10px; width: 96px; height: auto; }
 
 /* NOTE: st.container(border=True) keeps NATIVE styling (the
    stVerticalBlockBorderWrapper testid no longer exists in Streamlit 1.64+),
@@ -307,8 +328,20 @@ def theme_is_dark() -> bool:
     return st.session_state.get("theme_mode", "Light") == "Dark"
 
 
-# Inline SVG medical cross (HTML blocks can't use :material: shortcodes).
-LOGO_SVG = """<div class="login-logo">
+# Login brand tile: theme-aware ClinVision-AI mark (white on dark card,
+# navy on light card) rendered by the login form below.
+def login_brand_mark() -> None:
+    """Centered logo mark above the sign-in form."""
+    mark = LOGO_MARK_WHITE if theme_is_dark() else LOGO_MARK_NAVY
+    _, center, _ = st.columns([1, 1, 1])
+    with center:
+        if Path(mark).is_file():
+            st.image(mark, use_container_width=True)
+        else:
+            st.markdown(LOGO_SVG_FALLBACK, unsafe_allow_html=True)
+
+
+LOGO_SVG_FALLBACK = """<div class="login-logo">
 <svg width="30" height="30" viewBox="0 0 24 24" fill="none"
 stroke="#ffffff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
 <path d="M12 5v14M5 12h14"/></svg></div>"""
@@ -714,9 +747,14 @@ def build_pdf_report(result: dict, filename: str,
     pdf.set_auto_page_break(True, 20)
     pdf.add_page()
 
-    # Header band
+    # Header band with the ClinVision-AI mark on the left.
     pdf.set_fill_color(*TEAL)
     pdf.rect(0, 0, 210, 34, "F")
+    try:
+        if Path(LOGO_MARK_WHITE).is_file():
+            pdf.image(LOGO_MARK_WHITE, x=14, y=7, w=26)
+    except Exception:
+        pass  # logo is decorative; the report must always generate
     pdf.set_y(6)
     pdf.set_text_color(255, 255, 255)
     pdf.set_font("Helvetica", "B", 18)
@@ -996,7 +1034,8 @@ if not st.session_state.authenticated:
     _, mid, _ = st.columns([1, 1.35, 1])
     with mid:
         st.markdown(
-            """<div class="hero" style="text-align:center">
+            f"""<div class="hero" style="text-align:center">
+            <img class="hero-logo-center" src="{LOGO_MARK_URI}" alt="ClinVision-AI logo">
             <div class="badge">CLINICAL IMAGING COPILOT</div>
             <h1>ClinVision AI</h1>
             <p>RSNA pneumonia detection · Grad-CAM · free-LLM summary</p>
@@ -1004,7 +1043,7 @@ if not st.session_state.authenticated:
             unsafe_allow_html=True,
         )
         with st.container(border=True):
-            st.markdown(LOGO_SVG, unsafe_allow_html=True)
+            login_brand_mark()
             st.markdown("<h3 style='text-align:center;margin:0'>Doctor Sign In</h3>",
                         unsafe_allow_html=True)
             st.caption("Restricted to authorized clinicians.")
@@ -1051,9 +1090,11 @@ if not st.session_state.authenticated:
 health = fetch_health(API_URL)
 
 st.markdown(
-    """<div class="hero"><div class="badge">CLINVISION AI · DOCTOR PORTAL</div>
+    f"""<div class="hero hero-flex">
+    <img class="hero-logo" src="{LOGO_MARK_URI}" alt="ClinVision-AI logo">
+    <div><div class="badge">CLINVISION AI · DOCTOR PORTAL</div>
     <h1>Chest X-ray Copilot</h1>
-    <p>Upload a radiograph, review the model output, Grad-CAM and clinical summary.</p></div>""",
+    <p>Upload a radiograph, review the model output, Grad-CAM and clinical summary.</p></div></div>""",
     unsafe_allow_html=True,
 )
 
@@ -1076,8 +1117,13 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Sidebar - reorganised: 1 Patient · 2 Display · 3 Session
+# Sidebar - brand mark on top, then 1 Patient · 2 Display · 3 Session
 with st.sidebar:
+    _sb1, _sb2, _sb3 = st.columns([1, 1.1, 1])
+    with _sb2:
+        _sb_mark = LOGO_MARK_WHITE if theme_is_dark() else LOGO_MARK_NAVY
+        if Path(_sb_mark).is_file():
+            st.image(_sb_mark, use_container_width=True)
     st.header(f"{ic('context')} 1 · Patient context")
     st.caption("Context appears in the summary only - it never changes the vision model.")
     age_known = st.checkbox("Patient age known", value=False, key="sb_age_known")
