@@ -285,31 +285,51 @@ def bytes_to_model_input(raw: bytes, filename: str) -> tuple[np.ndarray, np.ndar
 # -----------------------------------------------------------------------------
 # Grad-CAM
 # -----------------------------------------------------------------------------
-def _find_target_layer(model: tf.keras.Model):
-    """Prefer DenseNet's final convolutional tensor; otherwise find last 4-D layer."""
+def _gradcam_forward(model: tf.keras.Model, input_batch: np.ndarray):
+    """Manual forward pass returning (conv_maps, grads) for Grad-CAM.
+
+    The nested DenseNet backbone cannot be re-wired into a single
+    ``tf.keras.Model(model.inputs, …)`` (Keras 3 raises "not connected to
+    inputs"), so the pipeline is replayed layer by layer under one
+    GradientTape: preprocess → backbone (conv target + output) → head.
+    Prefers the fine ``conv5_block16_concat`` maps, falls back to the
+    backbone output if the inner layer is missing.
+    """
+    preprocess = model.get_layer("densenet_preprocess")
+    backbone = model.get_layer("densenet121")
     try:
-        backbone = model.get_layer("densenet121")
-        return backbone.get_layer("conv5_block16_concat")
+        target_layer = backbone.get_layer("conv5_block16_concat")
     except Exception:
-        for layer in reversed(model.layers):
-            try:
-                output_shape = tuple(layer.output.shape)
-                if len(output_shape) == 4:
-                    return layer
-            except Exception:
-                continue
-    raise RuntimeError("No suitable convolutional layer found for Grad-CAM.")
-
-
-def gradcam_overlay(model: tf.keras.Model, input_batch: np.ndarray, original_gray: np.ndarray) -> np.ndarray:
-    """Generate a normalized RGB Grad-CAM overlay for the model's predicted class."""
-    target_layer = _find_target_layer(model)
-    grad_model = tf.keras.Model(model.inputs, [target_layer.output, model.output])
+        target_layer = None
+    target_out = target_layer.output if target_layer is not None else backbone.output
+    inner = tf.keras.Model(backbone.inputs, [target_out, backbone.output])
+    pre_model = tf.keras.Model(model.inputs, preprocess.output)
+    gap = model.get_layer("global_average_pool")
+    bn = model.get_layer("head_batch_norm")
+    drop = model.get_layer("head_dropout")
+    head = model.get_layer("pneumonia_probability")
 
     with tf.GradientTape() as tape:
-        conv_output, prediction = grad_model(input_batch, training=False)
-        score = prediction[:, 0]
-    gradients = tape.gradient(score, conv_output)
+        x0 = pre_model(input_batch, training=False)
+        conv_out, bb_out = inner(x0, training=False)
+        tape.watch(conv_out)
+        h = drop(bn(gap(bb_out, training=False), training=False), training=False)
+        score = head(h, training=False)[:, 0]
+    grads = tape.gradient(score, conv_out)
+    if grads is None:
+        raise RuntimeError("Grad-CAM gradients did not flow.")
+    return conv_out, grads
+
+
+def gradcam_overlay(model: tf.keras.Model, input_batch: np.ndarray,
+                      original_gray: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Generate (RGB overlay, RGB heatmap) for the model's predicted class.
+
+    The raw heatmap is returned alongside the pre-blended overlay so clients
+    can re-blend at any opacity (e.g. an examination slider) without a
+    second inference pass.
+    """
+    conv_output, gradients = _gradcam_forward(model, input_batch)
     weights = tf.reduce_mean(gradients, axis=(1, 2), keepdims=True)
     cam = tf.reduce_sum(weights * conv_output, axis=-1)[0]
     cam = tf.maximum(cam, 0)
@@ -318,10 +338,12 @@ def gradcam_overlay(model: tf.keras.Model, input_batch: np.ndarray, original_gra
 
     heat = cv2.resize(cam, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_LINEAR)
     heat = np.uint8(np.clip(heat, 0, 1) * 255)
-    heat = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
+    heat_bgr = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
     base = cv2.cvtColor(original_gray, cv2.COLOR_GRAY2BGR)
-    overlay = cv2.addWeighted(base, 0.60, heat, 0.40, 0)
-    return cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+    overlay = cv2.addWeighted(base, 0.60, heat_bgr, 0.40, 0)
+    return (cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB),
+            cv2.cvtColor(heat_bgr, cv2.COLOR_BGR2RGB),
+            heat)
 
 
 # -----------------------------------------------------------------------------
@@ -360,14 +382,61 @@ def build_template_summary(
     }
 
 
+LLM_ROLE = (
+    "You are 'ClinVision Assistant', a senior radiology copilot assisting a "
+    "licensed physician. You explain, structure and contextualize — you NEVER "
+    "diagnose, prescribe, order procedures, or replace clinical judgment."
+)
+
+LLM_SECTIONS = ("Summary", "Explanation", "Indications and next steps", "Limitations")
+
+
 def _llm_prompt(payload: dict) -> str:
     return (
-        "You are a strictly controlled clinical-support writer. Use ONLY the supplied JSON. "
-        "Never invent symptoms, findings, diagnosis, treatment, medication, urgency, or certainty. "
-        "Explicitly state this is an AI model output requiring professional review. "
-        "Rewrite the summary in 3-5 clear sentences for a physician.\n\n"
+        f"{LLM_ROLE} "
+        "Use ONLY the supplied JSON. Never invent symptoms, findings, diagnosis, "
+        "treatment, medication, urgency, or certainty. If a context field is empty, "
+        "say so instead of assuming. Explicitly state this is an AI model output "
+        "requiring professional review. "
+        "Write the note in English for the physician, using EXACTLY these four "
+        "headings, each on its own line starting with '### ':\n"
+        "### 1. Summary\n"
+        "2-3 sentences: what was analyzed, the model assessment and probability.\n"
+        "### 2. Explanation\n"
+        "Explain in plain clinical terms what this probability means, how the "
+        "Grad-CAM overlay should and should NOT be read, and why the supplied "
+        "clinical context cannot override the image model.\n"
+        "### 3. Indications and next steps\n"
+        "Suggest general, non-prescriptive steps the physician could consider "
+        "(e.g. clinical correlation, repeat or additional imaging, specialist "
+        "referral, laboratory workup), phrased strictly as possibilities, never "
+        "as orders. Never name drugs, doses, or specific procedures.\n"
+        "### 4. Limitations\n"
+        "Briefly restate the given limitations.\n\n"
         f"JSON: {json.dumps(payload, ensure_ascii=False)}"
     )
+
+
+def split_llm_sections(text: str) -> list[tuple[str, str]]:
+    """Split an LLM note into (heading, body) on '### ' markers.
+
+    Returns [] when no headings are found so callers fall back to raw text.
+    """
+    sections: list[tuple[str, str]] = []
+    current_title: Optional[str] = None
+    current_lines: list[str] = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("### "):
+            if current_title is not None:
+                sections.append((current_title, "\n".join(current_lines).strip()))
+            current_title = stripped[4:].strip(" #-*") or "Section"
+            current_lines = []
+        elif current_title is not None:
+            current_lines.append(line)
+    if current_title is not None:
+        sections.append((current_title, "\n".join(current_lines).strip()))
+    return [(t, b) for t, b in sections if b]
 
 
 def _call_ollama(prompt: str) -> Optional[str]:
@@ -396,9 +465,9 @@ def _call_openai_compatible(base_url: str, api_key: str, model: str, prompt: str
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={"model": model,
                   "messages": [
-                      {"role": "system",
-                       "content": "Use only supplied fields. Never invent clinical facts. "
-                                  "State this is an AI model output."},
+                      {"role": "system", "content": LLM_ROLE + " Follow the user's "
+                       "section structure exactly. Use only supplied fields. "
+                       "Never invent clinical facts. State this is an AI model output."},
                       {"role": "user", "content": prompt}],
                   "temperature": 0.0},
             timeout=timeout,
@@ -612,10 +681,14 @@ async def _predict_internal(file: UploadFile, include_gradcam: bool = False) -> 
         if include_gradcam:
             # Grad-CAM must never break the prediction itself.
             try:
-                overlay = gradcam_overlay(model, input_batch, original)
+                overlay, heatmap, mask = gradcam_overlay(model, input_batch, original)
                 ok, encoded = cv2.imencode(".png", cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-                if ok:
+                ok_h, encoded_h = cv2.imencode(".png", cv2.cvtColor(heatmap, cv2.COLOR_RGB2BGR))
+                ok_m, encoded_m = cv2.imencode(".png", mask)
+                if ok and ok_h and ok_m:
                     result["gradcam_png_base64"] = base64.b64encode(encoded.tobytes()).decode("ascii")
+                    result["gradcam_heatmap_base64"] = base64.b64encode(encoded_h.tobytes()).decode("ascii")
+                    result["gradcam_mask_base64"] = base64.b64encode(encoded_m.tobytes()).decode("ascii")
                 else:
                     result["gradcam_error"] = "Grad-CAM encoding failed."
             except Exception as exc:

@@ -1,0 +1,5 @@
+# ClinVision AI — Streamlit server settings.
+# maxUploadSize is in MB and must stay aligned with the backend's MAX_UPLOAD_MB
+# (backend/main.py rejects larger files with HTTP 413).
+[server]
+maxUploadSize = 20
