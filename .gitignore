@@ -12,6 +12,11 @@ data/cache_320/*
 !data/cache_320/.gitkeep
 data/metadata/*
 !data/metadata/.gitkeep
+# Demo subset (5 curated DICOMs + manifest) IS committed for the UI gallery.
+# Everything else under data/demo/ stays ignored.
+data/demo/*
+!data/demo/*.dcm
+!data/demo/manifest.json
 models/*.keras
 models/*.h5
 artifacts/*

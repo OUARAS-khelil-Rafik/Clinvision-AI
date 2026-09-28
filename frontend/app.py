@@ -3,7 +3,22 @@ ClinVision AI - Streamlit frontend (doctor portal).
 
 Self-contained: talks to FastAPI over HTTP, gates the UI behind a doctor
 login, and renders a clinical UX (stepper, gauge, Original-vs-Grad-CAM
-visual evidence, summary, history, report downloads).
+visual evidence, summary, patient history, PDF report downloads).
+
+File map (numbered sections match the banners below):
+
+  F0. Setup .............. imports, env, icon registry, page config
+  F1. Theme ............... Light/Dark CSS variables (+ Streamlit sync)
+  F2. Session state ....... defaults, theme apply, login/logo assets
+  F3. API helpers ......... auth headers, cached health/history/patients
+  F4. Image + PDF builders  DICOM decode, Grad-CAM blending, PDF report
+  F5. Login screen ........ centered doctor sign-in (stops the script)
+  F6. App shell ........... hero, account card, disclaimer, sidebar
+  F7. Analyze tab ......... upload/demo gallery, stepper, results, evidence
+  F8. History + About tabs  patient archive table, demo log, LLM setup
+
+Data flow for one analysis: upload/demo bytes -> POST /analyze -> result in
+session_state -> metrics + gauge + visual evidence + LLM summary + PDF.
 
 UI notes
 --------
@@ -38,6 +53,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import json
 import os
 from datetime import datetime
 from pathlib import Path
@@ -49,14 +65,18 @@ from dotenv import load_dotenv
 from PIL import Image
 
 load_dotenv()
+APP_ROOT = Path(__file__).resolve().parents[1]
 API_URL = os.getenv("API_URL", "http://localhost:8000").rstrip("/")
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
+# Curated demo subset (data/demo/*.dcm + manifest.json). Optional: the whole
+# gallery hides itself when the folder is absent (e.g. minimal installs).
+DEMO_DIR = APP_ROOT / "data" / "demo"
 # Local fallback so the demo login works even if the API is briefly down.
 LOCAL_USER = os.getenv("DOCTOR_USERNAME", "doctor")
 LOCAL_PASS = os.getenv("DOCTOR_PASSWORD", "doctor123")
 
 # -----------------------------------------------------------------------------
-# Icon system - single source of truth (Material Symbols, Streamlit-native).
+# F0. Icon system - single source of truth (Material Symbols, Streamlit-native).
 # Only long-established icon names are used so they always resolve.
 # -----------------------------------------------------------------------------
 ICONS = {
@@ -107,7 +127,7 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# Theme - CSS variables, light + dark palettes
+# F1. Theme - CSS variables, light + dark palettes
 # -----------------------------------------------------------------------------
 _LIGHT_VARS = """:root{
   --cv-appbg: linear-gradient(180deg, #f4f8fc 0%, #e9f1f8 100%);
@@ -283,6 +303,7 @@ def sync_streamlit_theme(mode: str) -> None:
 
 
 def theme_is_dark() -> bool:
+    """True when the user-selected portal theme is Dark (gauge + accents)."""
     return st.session_state.get("theme_mode", "Light") == "Dark"
 
 
@@ -293,7 +314,7 @@ stroke="#ffffff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="roun
 <path d="M12 5v14M5 12h14"/></svg></div>"""
 
 # -----------------------------------------------------------------------------
-# Session state
+# F2. Session state (defaults first, then pending DICOM autofill, then theme)
 # -----------------------------------------------------------------------------
 for _key, _default in {
     "authenticated": False,
@@ -306,6 +327,8 @@ for _key, _default in {
     "uploader_key": 0,  # bumped to reset the file uploader on "Clear"
     "theme_mode": "Light",
     "evidence_view": "Side by side",
+    "demo_name": None,   # active demo sample filename (None = manual upload)
+    "demo_bytes": None,  # active demo sample raw bytes
 }.items():
     if _key not in st.session_state:
         st.session_state[_key] = _default
@@ -340,11 +363,16 @@ apply_theme(st.session_state.theme_mode)
 
 
 def api_headers() -> dict:
+    """Authorization header for backend calls (empty when logged out/offline)."""
     if st.session_state.get("token"):
         return {"Authorization": f"Bearer {st.session_state.token}"}
     return {}
 
 
+# -----------------------------------------------------------------------------
+# F3. API helpers - auth headers plus cached backend reads (health, history,
+# patient archive). Caches keep the UI snappy across Streamlit reruns.
+# -----------------------------------------------------------------------------
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_health(api_url: str) -> dict | None:
     """Cached backend health probe (avoids a request on every rerun)."""
@@ -398,7 +426,6 @@ def fetch_patient_file(api_url: str, token: str | None,
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-@st.cache_data(ttl=600, show_spinner=False)
 def extract_dicom_metadata(raw: bytes, filename: str) -> dict:
     """Pull patient demographics embedded in a DICOM file, if present.
 
@@ -445,6 +472,47 @@ def extract_dicom_metadata(raw: bytes, filename: str) -> dict:
         return meta
     except Exception:
         return {}
+
+
+# -----------------------------------------------------------------------------
+# F4. Image + PDF builders - demo loader, DICOM decode, Grad-CAM blending,
+# evidence panel and the colored PDF report generator.
+# -----------------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_demo_samples() -> list[dict]:
+    """Read the curated demo subset (manifest + DICOM bytes).
+
+    Returns [] when data/demo/ is absent so the gallery hides itself.
+    Each item: {"file", "label", "note", "raw"}.
+    """
+    try:
+        manifest = json.loads((DEMO_DIR / "manifest.json").read_text(encoding="utf-8"))
+        samples = []
+        for entry in manifest.get("samples", []):
+            path = DEMO_DIR / entry.get("file", "")
+            if path.is_file():
+                samples.append({"file": entry["file"],
+                                "label": entry.get("label", ""),
+                                "note": entry.get("note", ""),
+                                "raw": path.read_bytes()})
+        return samples
+    except Exception:
+        return []
+
+
+class _DemoUpload:
+    """Minimal file-uploader stand-in: a demo sample flows through the exact
+    same pipeline (signature, preview, analyze, evidence) as a manual upload."""
+
+    def __init__(self, name: str, raw: bytes):
+        self.name = name
+        self._raw = raw
+        self.size = len(raw)
+        self.type = ("application/dicom" if name.lower().endswith(".dcm")
+                     else "image/png")
+
+    def getvalue(self) -> bytes:
+        return self._raw
 
 
 def decode_upload_for_display(raw: bytes, filename: str) -> bytes | None:
@@ -548,6 +616,7 @@ def do_login(username: str, password: str) -> tuple[bool, str]:
 
 
 def do_logout() -> None:
+    """Clear auth + results + API caches, then return to the login screen."""
     st.session_state.authenticated = False
     st.session_state.token = None
     st.session_state.username = None
@@ -561,6 +630,7 @@ def do_logout() -> None:
 
 
 def health_pill(health: dict | None) -> str:
+    """Status pill HTML: model ready (green), warming (amber), offline (red)."""
     if health and health.get("model_loaded"):
         return '<span class="pill pill-ok">● API online · model loaded</span>'
     if health:
@@ -580,6 +650,7 @@ def risk_band(probability: float) -> tuple[str, str]:
 
 
 def gauge(probability: float, dark: bool = False):
+    """Plotly probability gauge; `dark` switches inks for the Dark palette."""
     ink = "#e8f1f9" if dark else "#0b3d5f"
     muted = "#9db4c9" if dark else "#5b7a93"
     track = "#22344d" if dark else "#eef4fa"
@@ -919,7 +990,7 @@ def evidence_panel(original_png: bytes | None, gradcam_raw: bytes | None,
 
 
 # -----------------------------------------------------------------------------
-# LOGIN SCREEN
+# F5. Login screen - centered doctor sign-in; stops the script when logged out
 # -----------------------------------------------------------------------------
 if not st.session_state.authenticated:
     _, mid, _ = st.columns([1, 1.35, 1])
@@ -974,7 +1045,8 @@ if not st.session_state.authenticated:
     st.stop()
 
 # -----------------------------------------------------------------------------
-# AUTHENTICATED APP
+# F6. App shell - hero, account card, disclaimer, then the sidebar
+# (F6a patient context, F6b display, F6c session) and the F7/F8 tabs.
 # -----------------------------------------------------------------------------
 health = fetch_health(API_URL)
 
@@ -1053,9 +1125,14 @@ with st.sidebar:
             st.rerun()
 
 # Plain-text tab labels: tab labels don't expand :material: shortcodes.
+# F7/F8. Main tabs: Analyze pipeline, patient History archive, About/LLM help.
 tab_analyze, tab_history, tab_about = st.tabs(
     ["Analyze", "History", "About & LLM setup"])
 
+# -----------------------------------------------------------------------------
+# F7. Analyze tab - upload/demo gallery, stepper, preview, results,
+# Original-vs-Grad-CAM evidence, LLM summary, PDF export.
+# -----------------------------------------------------------------------------
 with tab_analyze:
     result = st.session_state.get("result")
     result_bytes = st.session_state.get("result_bytes")
@@ -1070,6 +1147,46 @@ with tab_analyze:
             type=["dcm", "jpg", "jpeg", "png"],
             key=f"cxr_{st.session_state.uploader_key}",
             help=f"Max {MAX_UPLOAD_MB} MB. DICOM gets modality/VOI LUT preprocessing.")
+
+        # Demo gallery: 5 curated RSNA DICOMs, usable with one click.
+        demo_samples = load_demo_samples()
+        if demo_samples:
+            st.divider()
+            st.markdown("**Or try a demo sample** (RSNA subset, labels known)")
+            active_demo = st.session_state.get("demo_name")
+            if active_demo:
+                dc1, dc2 = st.columns([3, 1])
+                with dc1:
+                    st.caption(f"Active demo: `{active_demo}`")
+                with dc2:
+                    if st.button("Remove demo", key="remove_demo",
+                                 use_container_width=True):
+                        st.session_state.demo_name = None
+                        st.session_state.demo_bytes = None
+                        st.rerun()
+            cols = st.columns(len(demo_samples))
+            for i, sample in enumerate(demo_samples):
+                with cols[i]:
+                    thumb = decode_upload_for_display(sample["raw"], sample["file"])
+                    if thumb is not None:
+                        st.image(thumb, use_container_width=True)
+                    st.caption(sample["label"][:22])
+                    if st.button("Use", key=f"use_demo_{i}",
+                                 use_container_width=True,
+                                 disabled=active_demo == sample["file"]):
+                        st.session_state.demo_name = sample["file"]
+                        st.session_state.demo_bytes = sample["raw"]
+                        st.session_state.uploader_key += 1  # drop manual file
+                        st.rerun()
+
+    # Effective input: a manual upload always wins over the demo sample.
+    if uploaded is not None:
+        if st.session_state.get("demo_bytes") is not None:
+            st.session_state.demo_bytes = None
+            st.session_state.demo_name = None
+    elif st.session_state.get("demo_bytes") is not None:
+        uploaded = _DemoUpload(st.session_state.demo_name,
+                               st.session_state.demo_bytes)
 
     # Replace-not-add: a different file clears the previous analysis display
     # (metrics, Grad-CAM, summary, evidence) instead of stacking below it.
@@ -1307,6 +1424,10 @@ with tab_analyze:
                         "2. (Optional) Fill in clinical context in the sidebar.\n"
                         "3. Press **Analyze image** and review prediction, Grad-CAM and summary.")
 
+# -----------------------------------------------------------------------------
+# F8a. History tab - patient archive table + record viewer, then the
+# lightweight demo log. (F8b About tab follows with pipeline + LLM setup.)
+# -----------------------------------------------------------------------------
 with tab_history:
     with st.container(border=True):
         st.subheader(f"{ic('folder')} Patient records (SQLite archive)")

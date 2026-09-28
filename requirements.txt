@@ -1,20 +1,31 @@
+# ClinVision AI - unified requirements (API + UI + notebook).
+# Python 3.11 is required (TensorFlow 2.18). GPU notes:
+#   NVIDIA CUDA training: pip install "tensorflow[and-cuda]==2.18.1"
+#   Apple Silicon GPU:    pip install tensorflow-metal==1.2.0 (arm64 venv)
+
+# --- ML / training -------------------------------------------------------
 numpy<2
 pandas>=2.1,<3
 scikit-learn>=1.4,<2
 matplotlib>=3.8,<4
 seaborn>=0.13,<1
+scipy>=1.11,<2
+TensorFlow==2.18.1
+kaggle>=1.8,<2            # RSNA dataset download only
+
+# --- Imaging (DICOM decode, resize, Grad-CAM overlays) --------------------
 Pillow>=10,<12
 opencv-python-headless>=4.9,<5
 pydicom>=3,<4
-scipy>=1.11,<2
-requests>=2.31,<3
-python-dotenv>=1,<2
+
+# --- Backend (FastAPI inference service) ---------------------------------
 fastapi>=0.115,<1
 uvicorn[standard]>=0.30,<1
-python-multipart>=0.0.9,<1
-streamlit>=1.39,<2
-plotly>=5.24,<7
-fpdf2>=2.7,<3
-TensorFlow==2.18.1
+python-multipart>=0.0.9,<1   # multipart DICOM/JPG/PNG uploads
+requests>=2.31,<3            # free-LLM HTTP calls (Ollama/Groq/Gemini/HF)
+python-dotenv>=1,<2
 
-kaggle>=1.8,<2
+# --- Frontend (Streamlit doctor portal) ----------------------------------
+streamlit>=1.39,<2
+plotly>=5.24,<7              # probability gauge
+fpdf2>=2.7,<3                # colored PDF report export

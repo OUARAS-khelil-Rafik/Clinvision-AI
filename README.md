@@ -2,31 +2,34 @@
 
 > Clinical Imaging Copilot — educational / hackathon prototype.
 > Chest X-ray pneumonia classification (DenseNet121) with DICOM-aware
-> preprocessing, Grad-CAM explainability, a doctor login portal, and
-> **free-LLM** clinical summaries.
+> preprocessing, Grad-CAM explainability, a doctor login portal, a 5-sample
+> DICOM demo gallery, a patient archive (SQLite), and **free-LLM** clinical
+> notes exported as colored PDF reports.
 
 NOT A MEDICAL DEVICE. Predictions, Grad-CAM overlays and summaries are AI
 model outputs for educational purposes only. All clinical decisions must be
 made by qualified professionals. No real patient data should be stored in
-this demo (history keeps request id, class and probability only).
+this demo (the archive keeps request id, class and probability plus whatever
+demo context was entered).
 
 ## Table of contents
 
 1. [Quickstart](#1-quickstart)
 2. [Demo credentials](#2-demo-credentials)
-3. [What is implemented](#3-what-is-implemented)
-4. [How it works](#4-how-it-works)
-5. [Repository structure](#5-repository-structure)
-6. [Backend API reference](#6-backend-api-reference)
-7. [Frontend tour](#7-frontend-tour)
-8. [Configuration](#8-configuration)
-9. [Free LLM setup](#9-free-llm-setup)
-10. [Local run](#10-local-run)
-11. [Docker deployment](#11-docker-deployment)
-12. [Training notebook](#12-training-notebook)
-13. [Troubleshooting](#13-troubleshooting)
-14. [Limitations](#14-limitations)
-15. [References](#15-references)
+3. [Demo samples](#3-demo-samples)
+4. [What is implemented](#4-what-is-implemented)
+5. [How it works](#5-how-it-works)
+6. [Repository structure](#6-repository-structure)
+7. [Backend API reference](#7-backend-api-reference)
+8. [Frontend tour](#8-frontend-tour)
+9. [Configuration](#9-configuration)
+10. [Free LLM setup](#10-free-llm-setup)
+11. [Local run](#11-local-run)
+12. [Docker deployment](#12-docker-deployment)
+13. [Training notebook](#13-training-notebook)
+14. [Troubleshooting](#14-troubleshooting)
+15. [Limitations](#15-limitations)
+16. [References](#16-references)
 
 ## 1. Quickstart
 
@@ -42,11 +45,12 @@ uvicorn backend.main:app --host 0.0.0.0 --port 8000
 API_URL=http://localhost:8000 streamlit run frontend/app.py
 ```
 
-Open `http://localhost:8501` and sign in (see credentials below).
-API docs: `http://localhost:8000/docs`. Health: `http://localhost:8000/health`.
+Open `http://localhost:8501` and sign in (see credentials below), or click a
+demo sample to start immediately. API docs: `http://localhost:8000/docs`.
+Health: `http://localhost:8000/health`.
 
 Trained weights must exist at `models/clinvision_pneumonia.keras`
-(see [Training notebook](#12-training-notebook)).
+(see [Training notebook](#13-training-notebook)).
 
 ## 2. Demo credentials
 
@@ -59,7 +63,23 @@ Used by the Streamlit login and `POST /auth/login`. Change via
 offline demo mode (local credential check) when the API is unreachable;
 inference itself always requires the API.
 
-## 3. What is implemented
+## 3. Demo samples
+
+`data/demo/` holds 5 curated RSNA DICOMs (committed, ~700 KB) described by
+`data/demo/manifest.json`:
+
+| Sample | RSNA class | Use |
+|--------|-----------|-----|
+| `00436515…` / `00704310…` | Lung Opacity | Positive examples |
+| `003d8fa0…` / `009482dc…` | Normal | Healthy negatives |
+| `0004cfab…` | No Lung Opacity / Not Normal | Abnormal non-pneumonia |
+
+The Analyze tab shows them as a thumbnail gallery: **Use** loads a sample
+through the exact same pipeline as an upload (preview, context reset, DICOM
+autofill, analysis, evidence, archive). A manual upload always wins over an
+active demo; **Remove demo** goes back to an empty uploader.
+
+## 4. What is implemented
 
 - RSNA Pneumonia Detection Challenge dataset handling (notebook)
 - Patient-level train/validation/test splitting (no leakage)
@@ -68,66 +88,72 @@ inference itself always requires the API.
 - DenseNet121 classifier (ImageNet transfer learning, sigmoid output)
 - Full evaluation: accuracy, ROC-AUC, PR-AUC, precision, recall,
   specificity, F1, confusion matrix, threshold sweep
-- Grad-CAM explainability (final dense block), failure-isolated so it can
-  never break the prediction itself
+- Grad-CAM explainability replayed layer-by-layer (nested-backbone safe),
+  returning overlay + raw heatmap + mask so the UI can re-blend at any
+  opacity with the uploaded image kept pixel-identical where cold
 - FastAPI service: request ids, timing metadata, file-size limits, typed
-  errors, startup model preload, SQLite demo history
-- Doctor login (bearer tokens, 12 h TTL) + token-gated history endpoints
-- Streamlit doctor portal: stepper flow, preview, probability gauge with
-  risk band, Grad-CAM view, clinical summary, TXT/JSON report export,
-  session + server history
+  errors, startup model preload, SQLite demo log + full patient archive
+- Doctor login (bearer tokens, 12 h TTL) + token-gated endpoints
+- Streamlit doctor portal: Light/Dark themes synced with Streamlit, stepper
+  flow, DICOM demo gallery, upload-replaces logic, DICOM sidebar autofill,
+  probability gauge with risk band, Original-vs-Grad-CAM evidence with
+  intensity slider, clinical summary, patient history table, PDF export
 - Free-LLM summary chain (Ollama local, Groq, Gemini, Hugging Face, custom
-  endpoint) with deterministic template fallback — the app runs with no
-  LLM configured at all
+  endpoint) with a "ClinVision Assistant" role and deterministic template
+  fallback — the app runs with no LLM configured at all
 
-## 4. How it works
+## 5. How it works
 
 ```text
-DICOM / JPG / PNG (<= MAX_UPLOAD_MB)
+DICOM / JPG / PNG  (or 1-click demo sample, <= MAX_UPLOAD_MB)
         |
 DICOM-aware preprocessing -> 320x320 gray -> RGB replicate (0-255 px)
         |
 DenseNet121 -> pneumonia probability (threshold 0.5)
         |
-Grad-CAM overlay (failure-isolated)
+Grad-CAM (overlay + heatmap + mask; failure-isolated, never breaks prediction)
         |
-Structured summary -> optional free-LLM rewrite
+Structured summary -> optional free-LLM rewrite (4 imposed sections)
         |
-FastAPI (JSON) -> Streamlit doctor portal
+FastAPI (JSON) -> Streamlit portal -> SQLite patient archive + PDF report
 ```
 
 Clinical context (age/sex/symptoms) is display-only for the summary; it is
-never fed to the vision model.
+never fed to the vision model. Uploading a new file replaces the previous
+analysis display; removing the file empties the area. Every new file resets
+the sidebar context to defaults, refilled from DICOM tags when present.
 
-## 5. Repository structure
+## 6. Repository structure
 
 ```text
 clinvision-ai-final/
 ├── ClinVision_AI_RSNA.ipynb   # full ML workflow (single source of truth)
 ├── backend/
-│   └── main.py                # FastAPI: inference, auth, history, free LLM
+│   └── main.py                # FastAPI: S0 config … S8 endpoints (see header)
 ├── frontend/
-│   └── app.py                 # Streamlit doctor portal (login + analysis UI)
+│   └── app.py                 # Streamlit portal: F0 setup … F8 tabs (see header)
 ├── data/
-│   ├── raw/                   # Kaggle DICOMs + CSVs (not in git)
-│   ├── cache_320/             # generated resized PNG cache
-│   └── metadata/              # generated split CSVs
+│   ├── demo/                  # 5 curated DICOMs + manifest.json (COMMITTED)
+│   ├── raw/                   # full Kaggle dataset (not in git)
+│   ├── cache_320/             # generated resized PNG cache (not in git)
+│   └── metadata/              # generated split CSVs (not in git)
 ├── models/
 │   └── clinvision_pneumonia.keras   # trained weights (not in git)
-├── artifacts/                 # metrics, plots, Grad-CAMs, history.sqlite3
-├── Dockerfile                 # CPU serving image (API + UI)
+├── artifacts/                 # metrics, plots, history.sqlite3,
+│                              # patient_images/ (not in git)
+├── .streamlit/config.toml     # server settings (upload limit 20 MB)
+├── Dockerfile                 # CPU serving image (API + UI + demo subset)
 ├── docker-compose.yml         # api + streamlit services
-├── requirements.txt           # base deps (TF 2.18.1, CPU)
-├── requirements-cuda.txt      # NVIDIA training variant
-├── requirements-mac.txt       # Apple Silicon (adds tensorflow-metal)
+├── requirements.txt           # single commented requirements file
 ├── .env.example               # all settings documented
 ├── SOURCE_REQUIREMENTS.md
 └── README.md
 ```
 
-Dataset, trained weights and PNG cache are intentionally not committed.
+Dataset, trained weights, PNG cache and archives are intentionally not
+committed — except the 5-file demo subset, which is part of the product.
 
-## 6. Backend API reference
+## 7. Backend API reference
 
 Start: `uvicorn backend.main:app --host 0.0.0.0 --port 8000`
 
@@ -140,11 +166,17 @@ Start: `uvicorn backend.main:app --host 0.0.0.0 --port 8000`
 | POST   | `/auth/login/json`  | no    | Doctor login (JSON) returns bearer token      |
 | GET    | `/auth/verify`      | token | Check current token                           |
 | POST   | `/predict`          | †     | Probability only (multipart `file`)           |
-| POST   | `/explain`          | †     | Probability + Grad-CAM PNG (base64)           |
+| POST   | `/explain`          | †     | Probability + Grad-CAM trio (base64 PNGs)     |
 | POST   | `/summary`          | †     | Summary for a probability + context (form)    |
-| POST   | `/analyze`          | †     | All-in-one: prediction + Grad-CAM + summary   |
+| POST   | `/analyze`          | †     | All-in-one + patient archive + DICOM tags     |
 | GET    | `/history?limit=50` | †     | Recent demo predictions                       |
-| DELETE | `/history`          | †     | Clear demo history                            |
+| DELETE | `/history`          | †     | Clear demo predictions                        |
+| GET    | `/patients`         | †     | Patient archive (metadata + LLM note)         |
+| GET    | `/patients/{id}`    | †     | One full patient record                       |
+| GET    | `/patients/{id}/image`   | † | Archived original upload                      |
+| GET    | `/patients/{id}/gradcam` | † | Archived Grad-CAM overlay                     |
+| DELETE | `/patients/{id}`    | †     | Delete record + files                         |
+| DELETE | `/patients`         | †     | Clear the whole archive                       |
 
 \* Token = `Authorization: Bearer <token>` from `/auth/login`.
 † Required only when `REQUIRE_AUTH=true` (default `false`, so existing
@@ -158,45 +190,51 @@ curl -X POST localhost:8000/auth/login/json \
   -H 'Content-Type: application/json' \
   -d '{"username":"doctor","password":"doctor123"}'
 
-# Full analysis (prediction + Grad-CAM + summary)
+# Full analysis (prediction + Grad-CAM + summary + archive)
 curl -X POST localhost:8000/analyze \
-  -F "file=@sample.png" -F "age=58" -F "sex=Male" -F "symptoms=cough, fever"
+  -F "file=@data/demo/00436515-870c-4b36-a041-de91049b9ab4.dcm" \
+  -F "age=58" -F "sex=Male" -F "symptoms=cough, fever"
 
-# Probability + Grad-CAM only
+# Probability + Grad-CAM trio only
 curl -X POST localhost:8000/explain -F "file=@sample.dcm"
 
-# Summary for a known probability
-curl -X POST localhost:8000/summary -F "probability=0.82" -F "symptoms=cough"
+# Patient archive
+curl localhost:8000/patients?limit=10
 ```
 
 Error contract: `400` empty/oversize upload or bad probability, `401` bad
 credentials (or missing token when `REQUIRE_AUTH=true`), `413` file over
-`MAX_UPLOAD_MB`, `422` undecodable image / inference failure, `500`
-unexpected.
+`MAX_UPLOAD_MB`, `422` undecodable image / inference failure, `404`
+unknown patient record, `500` unexpected.
 
-## 7. Frontend tour
+## 8. Frontend tour
 
 Start: `streamlit run frontend/app.py` → `http://localhost:8501`
 
 1. **Doctor Sign In** — username/password form in a centered card; shows an
    API status pill; falls back to offline demo mode if the API is down.
-2. **Analyze tab** — 3-step flow with a stepper header (Upload → Analyze →
-   Review): file upload with preview + size, context confirmation pulled
-   from the sidebar, **Analyze image** with staged progress. Results show a
-   risk-band pill, native metrics, a Plotly probability gauge,
-   request/model metadata, Grad-CAM with PNG download, clinical summary
-   with LLM-source badge, expandable structured details + limitations, and
-   TXT/JSON report export.
-3. **History tab** — this-session table plus cached server history with a
-   refresh button and a confirm-gated clear button (`DELETE /history`).
+2. **Analyze tab** — stepper-guided flow (Upload → Analyze → Review):
+   file upload (replace-not-add: a new file clears the old display,
+   removing the file empties everything) **or** the 5-sample demo gallery;
+   DICOM sidebar autofill (age/sex from tags, full reset otherwise);
+   preview with DICOM metadata line (`Patient ID · Study · Modality`);
+   **Analyze image** with staged progress. Results show a risk-band pill,
+   native metrics, a Plotly gauge, request/model metadata, DICOM metadata,
+   Original-vs-Grad-CAM evidence with view switcher + intensity slider
+   (masked blend: cold anatomy stays pixel-identical to the upload),
+   clinical summary with LLM-source badge, limitations, and PDF export.
+3. **History tab** — patient archive table (Date, File, Patient ID,
+   Prediction, Probability, Age, Sex, LLM) with record viewer (info,
+   archived images, full LLM summary, delete), refresh + clear-all; below
+   it the session table and the lightweight server log.
 4. **About tab** — pipeline recap and the Ollama one-liner.
 
-Sidebar: clinical context (age checkbox so "unknown" is explicit, sex,
-symptoms, context), session info (API URL, upload limit, active free-LLM
-backends), status refresh and clear actions. Health/history calls are
-cached (15 s / 30 s) to keep the UI responsive.
+Sidebar: patient context (text areas fixed-size with scrollbars, never
+resizable), display theme (Light/Dark, synced into Streamlit), session info
+(API URL, upload limit, active free-LLM backends), status refresh and clear
+actions. Health/history calls are cached to keep the UI responsive.
 
-## 8. Configuration
+## 9. Configuration
 
 Copy `.env.example` → `.env`:
 
@@ -205,7 +243,7 @@ Copy `.env.example` → `.env`:
 | `MODEL_PATH`           | `models/clinvision_pneumonia.keras`      | Weights file (repo-root relative)    |
 | `MODEL_VERSION`        | `clinvision-v2`                          | Version string in responses          |
 | `API_URL`              | `http://localhost:8000`                  | Backend URL for Streamlit            |
-| `MAX_UPLOAD_MB`        | `20`                                     | Upload size limit                    |
+| `MAX_UPLOAD_MB`        | `20`                                     | Upload size limit (also `.streamlit`)| 
 | `LOG_LEVEL`            | `INFO`                                   | `DEBUG` / `INFO` / `WARNING` …       |
 | `DOCTOR_USERNAME`      | `doctor`                                 | Portal + API login                   |
 | `DOCTOR_PASSWORD`      | `doctor123`                              | Portal + API login                   |
@@ -219,9 +257,9 @@ Copy `.env.example` → `.env`:
 | `HF_API_KEY/MODEL`     | — / `mistralai/Mistral-7B-Instruct-v0.3` | HF serverless free tier              |
 | `LLM_BASE_URL/API_KEY/MODEL` | —                                | Legacy custom OpenAI-compatible endpoint |
 
-Never commit API keys or patient data (`.env` is git-ignored).
+Never commit API keys or patient data (`.env`, `artifacts/` ignored).
 
-## 9. Free LLM setup
+## 10. Free LLM setup
 
 The summary chain tries providers in order and always falls back to the
 deterministic template — **no LLM is required to run the app**. Check active
@@ -239,11 +277,13 @@ Keep `OLLAMA_BASE_URL=http://localhost:11434` and `OLLAMA_MODEL=llama3.2`
 in `.env`. Alternatives: free `GROQ_API_KEY` (console.groq.com),
 `GEMINI_API_KEY` (aistudio.google.com), `HF_API_KEY` (huggingface.co).
 
-Safety design: temperature 0, "use only supplied fields" prompting, no
-invented symptoms/diagnoses/treatments, and the output always states it is
-an AI model output requiring professional review.
+The **ClinVision Assistant** role structures every note into Summary,
+Explanation, Indications and next steps, Limitations — temperature 0,
+fields-only grounding, no invented findings, no drugs/doses, always framed
+as AI output for professional review. The PDF report renders these sections
+with teal headings (graceful fallback to raw text for the template).
 
-## 10. Local run
+## 11. Local run
 
 ```bash
 source .venv/bin/activate
@@ -253,14 +293,14 @@ API_URL=http://localhost:8000 streamlit run frontend/app.py  # UI
 
 Hardware notes:
 
-- **NVIDIA CUDA (Linux/WSL2):** install `requirements-cuda.txt`, verify with
-  `nvidia-smi` then `tf.config.list_physical_devices('GPU')`.
-- **Apple Silicon (M1–M4):** `pip install -r requirements-mac.txt` (adds
-  `tensorflow-metal`) in a native arm64 Python 3.11 venv.
+- **NVIDIA CUDA (Linux/WSL2):** `pip install "tensorflow[and-cuda]==2.18.1`,
+  verify with `nvidia-smi` then `tf.config.list_physical_devices('GPU')`.
+- **Apple Silicon (M1–M4):** `pip install tensorflow-metal==1.2.0` in a
+  native arm64 Python 3.11 venv.
 - **CPU:** base `requirements.txt` works; reduce `BATCH_SIZE`/`IMAGE_SIZE`
   in the notebook if memory is tight.
 
-## 11. Docker deployment
+## 12. Docker deployment
 
 ```bash
 docker compose build
@@ -272,12 +312,15 @@ docker compose up
 | Streamlit | `http://localhost:8501`        |
 | FastAPI   | `http://localhost:8000/docs`   |
 
-The image is CPU-based (`python:3.11-slim` + OpenGL libs for OpenCV).
-`./models` is mounted read-only, `./artifacts` read-write. For Ollama on
-the host, point the API at `OLLAMA_BASE_URL=http://host.docker.internal:11434`.
-For GPU training use a CUDA host or Colab, not this serving image.
+The image is CPU-based (`python:3.11-slim` + OpenGL libs for OpenCV) with a
+healthcheck on `/health`. `COPY` bakes in code + the 700 KB demo subset;
+compose mounts `./models` read-only and `./artifacts` read-write. The
+uploader limit is aligned in three places: `MAX_UPLOAD_MB` (both services)
+and `.streamlit/config.toml`. For host Ollama, point the API at
+`OLLAMA_BASE_URL=http://host.docker.internal:11434`. For GPU training use a
+CUDA host or Colab, not this serving image.
 
-## 12. Training notebook
+## 13. Training notebook
 
 All ML lives in `ClinVision_AI_RSNA.ipynb` (run cells in order):
 
@@ -291,16 +334,16 @@ All ML lives in `ClinVision_AI_RSNA.ipynb` (run cells in order):
    no horizontal flip, to preserve laterality).
 7. Stage A: train head, backbone frozen (val-accuracy + val-AUC checkpoints,
    ReduceLROnPlateau, EarlyStopping).
-8. Stage B: fine-tune last 80 layers at low LR, BatchNorm frozen.
+8. Stage B: fine-tune last layers at low LR, BatchNorm frozen.
 9. Evaluation: accuracy @0.5 and @validation-selected threshold, ROC-AUC,
    PR-AUC, precision, recall, specificity, F1, confusion matrix, curves.
 
 Model profile: input 320×320×3, DenseNet121 (ImageNet) + GAP + BatchNorm +
-Dropout 0.20 + Dense(1, sigmoid), AdamW (3e-4 head / 5e-6 fine-tune).
-Reaching 90% validation accuracy is not guaranteed — always read recall,
-specificity and AUC alongside accuracy on this imbalanced task.
+Dropout 0.20 + Dense(1, sigmoid), AdamW. Reaching 90% validation accuracy is
+not guaranteed — always read recall, specificity and AUC alongside accuracy
+on this imbalanced task.
 
-## 13. Troubleshooting
+## 14. Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
@@ -308,20 +351,22 @@ specificity and AUC alongside accuracy on this imbalanced task.
 | Streamlit "API unreachable" | API not running, wrong `API_URL` (Docker: `http://api:8000`), or port clash (`lsof -i :8000`) |
 | Login fails | Check `DOCTOR_USERNAME`/`DOCTOR_PASSWORD`; expired token → log in again |
 | `422` on upload | File corrupt/unsupported (DCM/JPG/PNG only) or under 32 px |
-| `413` on upload | Over `MAX_UPLOAD_MB`; raise limit or compress |
+| `413` on upload | Over `MAX_UPLOAD_MB`; raise limit in `.env`, compose AND `.streamlit/config.toml` |
 | Template summary instead of LLM | No backend reachable — check `GET /llm/status`, `ollama serve`, model pulled |
+| Overlay looks like another image | Fixed: blends are keyed per-image and the Original panel always decodes the analyzed bytes; re-pull latest code |
+| Gallery missing | `data/demo/` absent (minimal installs hide the section gracefully) |
 | TF sees no GPU (NVIDIA) | Check `nvidia-smi` first, then the CUDA TF install |
 | TF sees no GPU (Mac) | Native arm64 venv + `tensorflow-metal==1.2.0` |
 | OOM in training | Lower `BATCH_SIZE` (e.g. 4) / `IMAGE_SIZE` (e.g. 256), prefer local SSD |
 
-## 14. Limitations
+## 15. Limitations
 
 Engineering prototype on the RSNA Pneumonia Detection Challenge data: no
 clinical/prospective validation, no regulatory clearance, no guaranteed
 reliability on real hospital populations. Grad-CAM is explanatory, not a
 validated lesion localiser. Do not use as a standalone diagnostic system.
 
-## 15. References
+## 16. References
 
 - RSNA Pneumonia Detection Challenge: https://www.kaggle.com/competitions/rsna-pneumonia-detection-challenge/data
 - TensorFlow pip install: https://www.tensorflow.org/install/pip

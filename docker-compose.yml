@@ -1,3 +1,12 @@
+# ClinVision AI - local deployment (CPU).
+# Usage: `docker compose build && docker compose up`
+#   UI:  http://localhost:8501  (login: doctor / doctor123)
+#   API: http://localhost:8000/docs
+#
+# Volumes:
+#   ./models    -> read-only trained weights (*.keras, built by the notebook)
+#   ./artifacts -> read-write SQLite history + archived patient images
+#   (data/demo/ is baked into the image, no mount needed.)
 services:
   api:
     build: .
@@ -8,6 +17,12 @@ services:
       MODEL_PATH: /app/models/clinvision_pneumonia.keras
       MODEL_VERSION: clinvision-v2
       MAX_UPLOAD_MB: 20
+      # Auth + free LLM are optional here; uncomment to harden/demo:
+      # REQUIRE_AUTH: "false"          # "true" forces bearer tokens
+      # DOCTOR_USERNAME: doctor
+      # DOCTOR_PASSWORD: doctor123
+      # OLLAMA_BASE_URL: http://host.docker.internal:11434  # host Ollama
+      # OLLAMA_MODEL: llama3.2
     volumes:
       - ./models:/app/models:ro
       - ./artifacts:/app/artifacts
@@ -18,7 +33,7 @@ services:
     ports:
       - "8501:8501"
     environment:
-      API_URL: http://api:8000
-      MAX_UPLOAD_MB: 20
+      API_URL: http://api:8000   # service name, not localhost, inside compose
+      MAX_UPLOAD_MB: 20          # keep aligned with the API limit above
     depends_on:
       - api

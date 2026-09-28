@@ -1,0 +1,31 @@
+{
+  "source": "RSNA Pneumonia Detection Challenge (stage_2_train_images)",
+  "note": "Curated demo subset. Labels are the RSNA detailed classes (ground truth for demo purposes).",
+  "samples": [
+    {
+      "file": "00436515-870c-4b36-a041-de91049b9ab4.dcm",
+      "label": "Lung Opacity",
+      "note": "Positive example"
+    },
+    {
+      "file": "00704310-78a8-4b38-8475-49f4573b2dbb.dcm",
+      "label": "Lung Opacity",
+      "note": "Positive example"
+    },
+    {
+      "file": "003d8fa0-6bf1-40ed-b54c-ac657f8495c5.dcm",
+      "label": "Normal",
+      "note": "Negative example, healthy"
+    },
+    {
+      "file": "009482dc-3db5-48d4-8580-5c89c4f01334.dcm",
+      "label": "Normal",
+      "note": "Negative example, healthy"
+    },
+    {
+      "file": "0004cfab-14fd-4e49-80ba-63a80b6bddd6.dcm",
+      "label": "No Lung Opacity / Not Normal",
+      "note": "Negative example, abnormal but non-pneumonia"
+    }
+  ]
+}

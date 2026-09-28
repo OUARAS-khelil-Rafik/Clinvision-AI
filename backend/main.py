@@ -1,9 +1,25 @@
 """
 ClinVision AI - FastAPI inference service.
 
-ML workflow lives in ClinVision_AI_RSNA.ipynb; this module contains only
-production-facing inference logic (preprocessing, model serving, Grad-CAM,
-auth, history, and free-LLM clinical summaries).
+The ML workflow lives in ClinVision_AI_RSNA.ipynb; this module contains only
+production-facing inference logic. It is organized in numbered sections:
+
+  S0. Configuration ............ env-driven settings (model, upload, auth, LLM)
+  S1. Model lifecycle .......... lazy singleton load + startup preload
+  S2. Doctor auth .............. demo bearer-token login (/auth/*)
+  S3. Preprocessing ............ DICOM-aware decode to model-ready tensors
+  S4. Grad-CAM ................. layer-by-layer explainability (overlay+heatmap+mask)
+  S5. Clinical summaries ....... template + free-LLM chain (Ollama first)
+  S6. Demo history ............. lightweight predictions log (SQLite)
+  S7. Patient archive .......... full analyses: files on disk + SQLite rows
+  S8. HTTP endpoints ........... /health, /predict, /explain, /summary,
+                                 /analyze, /history, /patients, /llm/status
+
+Request flow for POST /analyze (the all-in-one endpoint):
+  upload -> _read_upload (size guard) -> bytes_to_model_input (S3)
+  -> model.predict -> gradcam_overlay (S4, failure-isolated)
+  -> build_template_summary + maybe_llm_summary (S5)
+  -> record_history (S6) + record_patient (S7) -> JSON response.
 """
 from __future__ import annotations
 
@@ -39,7 +55,7 @@ from pydicom.pixels import apply_modality_lut, apply_voi_lut
 load_dotenv()
 
 # -----------------------------------------------------------------------------
-# Configuration
+# S0. Configuration - every setting comes from the environment
 # -----------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_PATH = Path(os.getenv("MODEL_PATH", ROOT / "models" / "clinvision_pneumonia.keras"))
@@ -83,7 +99,7 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
 LLM_MODEL = os.getenv("LLM_MODEL", "").strip()
 
 # -----------------------------------------------------------------------------
-# App lifespan - preload model + init DB once
+# S1. Model lifecycle - lazy singleton + startup preload
 # -----------------------------------------------------------------------------
 MODEL = None
 _TOKENS: dict[str, float] = {}  # token -> expiry epoch
@@ -101,6 +117,7 @@ def get_model() -> tf.keras.Model:
 
 
 def init_history() -> None:
+    """Create the lightweight predictions log table if missing (idempotent)."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as connection:
         connection.execute(
@@ -113,6 +130,7 @@ def init_history() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Startup/shutdown hook: init DBs, preload the model (non-fatal)."""
     init_history()
     init_patient_history()
     try:
@@ -141,18 +159,21 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 
 # -----------------------------------------------------------------------------
-# Auth - simple demo token auth for the doctor portal
+# S2. Doctor auth - demo bearer tokens for the doctor portal
 # -----------------------------------------------------------------------------
 class LoginRequest(BaseModel):
+    """JSON login body for POST /auth/login/json (form variant also exists)."""
     username: str = ""
     password: str = ""
 
 
 def _password_ok(candidate: str) -> bool:
+    """Constant-time password comparison against DOCTOR_PASSWORD."""
     return hmac.compare_digest(candidate or "", DOCTOR_PASSWORD)
 
 
 def _issue_token(username: str) -> dict:
+    """Mint a random bearer token with TTL; returns the login response dict."""
     token = secrets.token_urlsafe(32)
     _TOKENS[token] = time.time() + AUTH_TOKEN_TTL_SECONDS
     return {
@@ -164,6 +185,7 @@ def _issue_token(username: str) -> dict:
 
 
 def _token_valid(token: str) -> bool:
+    """Check the in-memory token store; lazily evict expired tokens."""
     expiry = _TOKENS.get(token or "")
     if not expiry:
         return False
@@ -185,6 +207,11 @@ async def get_current_user(
 async def require_user_if_enabled(
     user: Optional[str] = Depends(get_current_user),
 ) -> Optional[str]:
+    """Auth gate for inference/history endpoints.
+
+    Enforced only when REQUIRE_AUTH=true, so existing scripts keep working
+    while the portal can lock the API down via .env.
+    """
     if REQUIRE_AUTH and not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -211,6 +238,7 @@ async def login(
 
 @app.post("/auth/login/json")
 async def login_json(body: LoginRequest) -> JSONResponse:
+    """Doctor login via JSON body; returns a bearer token on success."""
     if (body.username or "").strip() == DOCTOR_USERNAME and _password_ok(body.password):
         return JSONResponse(_issue_token(DOCTOR_USERNAME))
     raise HTTPException(status_code=401, detail="Invalid username or password.")
@@ -218,11 +246,12 @@ async def login_json(body: LoginRequest) -> JSONResponse:
 
 @app.get("/auth/verify")
 async def verify(user: Optional[str] = Depends(get_current_user)) -> JSONResponse:
+    """Report whether the caller's bearer token is currently valid."""
     return JSONResponse({"authenticated": bool(user), "username": user})
 
 
 # -----------------------------------------------------------------------------
-# DICOM/image preprocessing
+# S3. DICOM/image preprocessing - decode uploads to model-ready tensors
 # -----------------------------------------------------------------------------
 def _normalise_uint8(array: np.ndarray) -> np.ndarray:
     """Robustly normalize an intensity array to 8-bit without clipping everything."""
@@ -285,7 +314,7 @@ def bytes_to_model_input(raw: bytes, filename: str) -> tuple[np.ndarray, np.ndar
 
 
 # -----------------------------------------------------------------------------
-# Grad-CAM
+# S4. Grad-CAM - explainability replayed layer by layer
 # -----------------------------------------------------------------------------
 def _gradcam_forward(model: tf.keras.Model, input_batch: np.ndarray):
     """Manual forward pass returning (conv_maps, grads) for Grad-CAM.
@@ -349,7 +378,7 @@ def gradcam_overlay(model: tf.keras.Model, input_batch: np.ndarray,
 
 
 # -----------------------------------------------------------------------------
-# Structured summary + FREE LLM (Ollama local first, then free cloud tiers)
+# S5. Clinical summaries - deterministic template + free-LLM chain
 # -----------------------------------------------------------------------------
 def build_template_summary(
     probability: float,
@@ -394,6 +423,7 @@ LLM_SECTIONS = ("Summary", "Explanation", "Indications and next steps", "Limitat
 
 
 def _llm_prompt(payload: dict) -> str:
+    """Build the role + structured-section prompt sent to every LLM backend."""
     return (
         f"{LLM_ROLE} "
         "Use ONLY the supplied JSON. Never invent symptoms, findings, diagnosis, "
@@ -461,6 +491,11 @@ def _call_ollama(prompt: str) -> Optional[str]:
 
 
 def _call_openai_compatible(base_url: str, api_key: str, model: str, prompt: str, timeout: int = 25) -> Optional[str]:
+    """Chat-completions call for OpenAI-style APIs (Groq, LM Studio, vLLM...).
+
+    Returns the generated text, or None when unreachable - the caller then
+    tries the next provider instead of failing the request.
+    """
     try:
         r = requests.post(
             base_url.rstrip("/") + "/chat/completions",
@@ -482,6 +517,7 @@ def _call_openai_compatible(base_url: str, api_key: str, model: str, prompt: str
 
 
 def _call_gemini(prompt: str) -> Optional[str]:
+    """Google Gemini free-tier call; None when unconfigured/unreachable."""
     try:
         url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
                f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}")
@@ -496,6 +532,7 @@ def _call_gemini(prompt: str) -> Optional[str]:
 
 
 def _call_huggingface(prompt: str) -> Optional[str]:
+    """Hugging Face serverless inference call; None when unavailable."""
     try:
         r = requests.post(
             f"https://api-inference.huggingface.co/models/{HF_MODEL}",
@@ -575,9 +612,10 @@ def maybe_llm_summary(summary_payload: dict) -> dict:
 
 
 # -----------------------------------------------------------------------------
-# Demo history - no real patient data should be stored here.
+# S6. Demo history - lightweight predictions log (no patient data)
 # -----------------------------------------------------------------------------
 def record_history(request_id: str, predicted_class: str, probability: float) -> None:
+    """Append one row to the lightweight predictions log (S6)."""
     init_history()
     with sqlite3.connect(DB_PATH) as connection:
         connection.execute(
@@ -588,6 +626,7 @@ def record_history(request_id: str, predicted_class: str, probability: float) ->
 
 
 def read_history(limit: int = 50) -> list[dict]:
+    """Read the most recent prediction rows, newest first (clamped limit)."""
     init_history()
     with sqlite3.connect(DB_PATH) as connection:
         connection.row_factory = sqlite3.Row
@@ -600,7 +639,7 @@ def read_history(limit: int = 50) -> list[dict]:
 
 
 # -----------------------------------------------------------------------------
-# Patient records - full analysis archive (image + context + LLM note).
+# S7. Patient archive - full analyses: files on disk + SQLite rows
 # Local demo storage only; never commit real patient data.
 # -----------------------------------------------------------------------------
 PATIENT_COLUMNS = (
@@ -626,6 +665,7 @@ def extract_dicom_tags(raw: bytes) -> dict:
 
 
 def init_patient_history() -> None:
+    """Create the patient archive table + image dir; migrate old schemas."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     PATIENT_IMG_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as connection:
@@ -648,6 +688,7 @@ def init_patient_history() -> None:
 
 
 def _safe_suffix(filename: str) -> str:
+    """Whitelisted file extension for archived uploads (else '.bin')."""
     suffix = Path(filename or "").suffix.lower()
     return suffix if suffix in ALLOWED_EXTENSIONS else ".bin"
 
@@ -694,6 +735,7 @@ def record_patient(request_id: str, raw: bytes, filename: str, age: str,
 
 
 def read_patients(limit: int = 50, offset: int = 0) -> list[dict]:
+    """Paginated patient records, newest first (metadata + LLM note, no blobs)."""
     init_patient_history()
     with sqlite3.connect(DB_PATH) as connection:
         connection.row_factory = sqlite3.Row
@@ -706,6 +748,7 @@ def read_patients(limit: int = 50, offset: int = 0) -> list[dict]:
 
 
 def read_patient(request_id: str) -> Optional[dict]:
+    """Fetch one patient record by id (None when unknown)."""
     init_patient_history()
     with sqlite3.connect(DB_PATH) as connection:
         connection.row_factory = sqlite3.Row
@@ -717,6 +760,7 @@ def read_patient(request_id: str) -> Optional[dict]:
 
 
 def delete_patient(request_id: str) -> bool:
+    """Delete a patient row plus its archived files; False when unknown."""
     init_patient_history()
     record = read_patient(request_id)
     if record is None:
@@ -735,10 +779,11 @@ def delete_patient(request_id: str) -> bool:
 
 
 # -----------------------------------------------------------------------------
-# API endpoints
+# S8. HTTP endpoints - the public API surface (see module docstring)
 # -----------------------------------------------------------------------------
 @app.get("/")
 def root() -> dict:
+    """Service index: version, docs link and the endpoint catalogue."""
     return {
         "service": "ClinVision AI API",
         "version": MODEL_VERSION,
@@ -770,16 +815,19 @@ def health() -> dict:
 
 @app.get("/llm/status")
 def llm_status_endpoint() -> dict:
+    """Which free-LLM backends are configured (no secrets leaked)."""
     return llm_status()
 
 
 @app.get("/history")
 def history(limit: int = 50, _user: Optional[str] = Depends(require_user_if_enabled)) -> dict:
+    """Recent rows of the lightweight predictions log (S6)."""
     return {"count": None, "items": read_history(limit)}
 
 
 @app.delete("/history")
 def clear_history(_user: Optional[str] = Depends(require_user_if_enabled)) -> dict:
+    """Wipe the lightweight predictions log (patient archive untouched)."""
     init_history()
     with sqlite3.connect(DB_PATH) as connection:
         connection.execute("DELETE FROM predictions")
@@ -799,6 +847,13 @@ async def _read_upload(file: UploadFile) -> bytes:
 
 async def _predict_internal(file: UploadFile, include_gradcam: bool = False,
                              raw: Optional[bytes] = None) -> dict:
+    """Shared inference core for /predict, /explain and /analyze.
+
+    Reads (or reuses, for /analyze which also archives) the upload, runs the
+    model, optionally attaches Grad-CAM artefacts (overlay+heatmap+mask) and
+    always logs to the S6 history. Grad-CAM failures degrade to a
+    `gradcam_error` field instead of failing the prediction.
+    """
     request_id = str(uuid.uuid4())
     start = time.perf_counter()
     if raw is None:
@@ -847,12 +902,14 @@ async def _predict_internal(file: UploadFile, include_gradcam: bool = False,
 @app.post("/predict")
 async def predict(file: UploadFile = File(...),
                   _user: Optional[str] = Depends(require_user_if_enabled)) -> JSONResponse:
+    """Pneumonia probability for an uploaded image (no Grad-CAM)."""
     return JSONResponse(await _predict_internal(file, include_gradcam=False))
 
 
 @app.post("/explain")
 async def explain(file: UploadFile = File(...),
                   _user: Optional[str] = Depends(require_user_if_enabled)) -> JSONResponse:
+    """Pneumonia probability plus Grad-CAM overlay/heatmap/mask (base64 PNGs)."""
     return JSONResponse(await _predict_internal(file, include_gradcam=True))
 
 
@@ -865,6 +922,7 @@ async def summary(
     context: str = Form(""),
     _user: Optional[str] = Depends(require_user_if_enabled),
 ) -> JSONResponse:
+    """Standalone clinical summary for a known probability + context."""
     if not 0.0 <= probability <= 1.0:
         raise HTTPException(status_code=400, detail="probability must be between 0 and 1")
     payload = build_template_summary(probability, age, sex, symptoms, context)
@@ -880,6 +938,7 @@ async def analyze(
     context: str = Form(""),
     _user: Optional[str] = Depends(require_user_if_enabled),
 ) -> JSONResponse:
+    """All-in-one: prediction + Grad-CAM + LLM summary, then patient archive."""
     raw = await _read_upload(file)  # read once: reused for inference + archive
     result = await _predict_internal(file, include_gradcam=True, raw=raw)
     summary_payload = build_template_summary(result["probability"], age, sex, symptoms, context)
@@ -896,6 +955,7 @@ async def analyze(
 @app.get("/patients")
 def list_patients(limit: int = 50, offset: int = 0,
                   _user: Optional[str] = Depends(require_user_if_enabled)) -> dict:
+    """Paginated patient archive (metadata + LLM note; images via sub-paths)."""
     items = read_patients(limit, offset)
     return {"items": items, "limit": limit, "offset": offset}
 
@@ -903,6 +963,7 @@ def list_patients(limit: int = 50, offset: int = 0,
 @app.get("/patients/{request_id}")
 def get_patient(request_id: str,
                 _user: Optional[str] = Depends(require_user_if_enabled)) -> JSONResponse:
+    """One full patient record (404 when unknown)."""
     record = read_patient(request_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Patient record not found.")
@@ -910,6 +971,7 @@ def get_patient(request_id: str,
 
 
 def _patient_file(request_id: str, field: str, media_type: str) -> FileResponse:
+    """Serve an archived file, jailed inside PATIENT_IMG_DIR (no path escape)."""
     record = read_patient(request_id)
     if record is None or not record.get(field):
         raise HTTPException(status_code=404, detail="File not found.")
@@ -923,6 +985,7 @@ def _patient_file(request_id: str, field: str, media_type: str) -> FileResponse:
 @app.get("/patients/{request_id}/image")
 def get_patient_image(request_id: str,
                       _user: Optional[str] = Depends(require_user_if_enabled)) -> FileResponse:
+    """Download the archived original upload (correct media type per suffix)."""
     record = read_patient(request_id)
     suffix = _safe_suffix((record or {}).get("filename", ""))
     media = {"dcm": "application/dicom"}.get(suffix.lstrip("."), "image/png")
@@ -936,12 +999,14 @@ def get_patient_image(request_id: str,
 @app.get("/patients/{request_id}/gradcam")
 def get_patient_gradcam(request_id: str,
                         _user: Optional[str] = Depends(require_user_if_enabled)) -> FileResponse:
+    """Download the archived Grad-CAM overlay PNG (404 when none)."""
     return _patient_file(request_id, "gradcam_path", "image/png")
 
 
 @app.delete("/patients/{request_id}")
 def remove_patient(request_id: str,
                    _user: Optional[str] = Depends(require_user_if_enabled)) -> dict:
+    """Delete one patient record plus its archived files."""
     if not delete_patient(request_id):
         raise HTTPException(status_code=404, detail="Patient record not found.")
     return {"deleted": request_id}
@@ -949,6 +1014,7 @@ def remove_patient(request_id: str,
 
 @app.delete("/patients")
 def clear_patients(_user: Optional[str] = Depends(require_user_if_enabled)) -> dict:
+    """Wipe the whole patient archive (rows + files)."""
     init_patient_history()
     for record in read_patients(limit=500):
         delete_patient(record["request_id"])
@@ -957,6 +1023,8 @@ def clear_patients(_user: Optional[str] = Depends(require_user_if_enabled)) -> d
 
 @app.exception_handler(Exception)
 async def fallback_exception_handler(_, exc: Exception):
+    """Last-resort handler: intentional HTTP errors pass through untouched,
+    anything else becomes a generic 500 (details stay in server logs)."""
     # Preserve HTTPExceptions raised intentionally.
     if isinstance(exc, HTTPException):
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
