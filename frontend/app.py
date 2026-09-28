@@ -1,5 +1,5 @@
 """
-ClinVision AI — Streamlit frontend (doctor portal).
+ClinVision AI - Streamlit frontend (doctor portal).
 
 Self-contained: talks to FastAPI over HTTP, gates the UI behind a doctor
 login, and renders a clinical UX (stepper, gauge, Original-vs-Grad-CAM
@@ -20,12 +20,12 @@ UI notes
   receives matching colors explicitly.
 * Cards keep NATIVE bordered-container styling (the
   ``stVerticalBlockBorderWrapper`` testid no longer exists in Streamlit
-  1.64+, so it must not be targeted) — native containers already adapt to
+  1.64+, so it must not be targeted) - native containers already adapt to
   light/dark. Custom CSS covers only our own classes (hero, stepper, pills,
   disclaimer) plus version-proof button selectors (runtime testids are
   ``stBaseButton-<kind>``; form submits use ``stFormSubmitButton``).
 * Font is applied by inheritance (``.stApp``) and inside markdown containers
-  only — never via ``[class*="st-"]``, which would override the
+  only - never via ``[class*="st-"]``, which would override the
   Material-Symbol ligature font of Streamlit's internal icons and leak
   stray text such as "visibili" in the password field.
 * ``/health`` and ``/history`` are cached to avoid a request per rerun.
@@ -36,6 +36,7 @@ UI notes
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import os
 from datetime import datetime
@@ -55,7 +56,7 @@ LOCAL_USER = os.getenv("DOCTOR_USERNAME", "doctor")
 LOCAL_PASS = os.getenv("DOCTOR_PASSWORD", "doctor123")
 
 # -----------------------------------------------------------------------------
-# Icon system — single source of truth (Material Symbols, Streamlit-native).
+# Icon system - single source of truth (Material Symbols, Streamlit-native).
 # Only long-established icon names are used so they always resolve.
 # -----------------------------------------------------------------------------
 ICONS = {
@@ -83,6 +84,7 @@ ICONS = {
     "how": "lightbulb",
     "history": "history",
     "server": "storage",
+    "folder": "folder_shared",
     "refresh": "refresh",
     "clear": "delete_sweep",
     "delete": "delete",
@@ -98,14 +100,14 @@ def ic(name: str) -> str:
 
 
 st.set_page_config(
-    page_title="ClinVision AI — Doctor Portal",
+    page_title="ClinVision AI - Doctor Portal",
     page_icon="🩻",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # -----------------------------------------------------------------------------
-# Theme — CSS variables, light + dark palettes
+# Theme - CSS variables, light + dark palettes
 # -----------------------------------------------------------------------------
 _LIGHT_VARS = """:root{
   --cv-appbg: linear-gradient(180deg, #f4f8fc 0%, #e9f1f8 100%);
@@ -137,7 +139,7 @@ _DARK_VARS = """:root{
 }"""
 _THEME_BODY = """
 <style>
-/* Font: inheritance only. Never override [class*="st-"] — that kills the
+/* Font: inheritance only. Never override [class*="st-"] - that kills the
    Material-Symbol ligatures of Streamlit's internal icons (password eye,
    uploader glyph, chevrons), which render as stray text like "visibili". */
 .stApp { font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif; }
@@ -185,7 +187,7 @@ div[data-testid="stMarkdownContainer"] h3 { color: var(--cv-ink); }
 .step.done { color: var(--cv-step-done-ink); border-color: var(--cv-step-done-bd);
   background: var(--cv-step-done-bg); }
 
-/* Buttons — version-proof selectors.
+/* Buttons - version-proof selectors.
    Runtime testids are stBaseButton-<kind>; form submits use stFormSubmitButton
    (without it the Sign-in button falls back to the default red primary). */
 div[data-testid="stButton"] > button,
@@ -226,7 +228,7 @@ button[kind="primary"] {
   padding: 10px 12px; font-size: .82rem; color: var(--cv-hint-ink); margin-top: 12px;
 }
 .footer { text-align: center; color: var(--cv-footer); font-size: .78rem; margin: 22px 0 8px; }
-/* Sidebar/clinical text frames: fixed size, internal scrollbar — never resizable. */
+/* Sidebar/clinical text frames: fixed size, internal scrollbar - never resizable. */
 div[data-testid="stTextArea"] textarea {
   resize: none !important;
   overflow-y: auto !important;
@@ -299,6 +301,7 @@ for _key, _default in {
     "username": None,
     "result": None,
     "result_filename": None,
+    "result_bytes": None,  # exact analyzed bytes: overlay always pairs with THESE
     "session_history": [],
     "uploader_key": 0,  # bumped to reset the file uploader on "Clear"
     "theme_mode": "Light",
@@ -306,6 +309,31 @@ for _key, _default in {
 }.items():
     if _key not in st.session_state:
         st.session_state[_key] = _default
+
+# Pending clinical-context sync (queued when a NEW file arrives, applied here
+# BEFORE the sidebar widgets instantiate — modifying widget state later in
+# the run would raise). Rule: every new file first resets ALL context fields
+# to defaults, then DICOM demographics refill what the file provides.
+_pending = st.session_state.pop("pending_context", None)
+if _pending:
+    st.session_state["sb_age_known"] = False
+    st.session_state["sb_age"] = 30
+    st.session_state["sb_sex"] = "Not specified"
+    st.session_state["sb_symptoms"] = ""
+    st.session_state["sb_context"] = ""
+    _meta = _pending.get("meta") or {}
+    _applied = []
+    if _meta.get("age") is not None:
+        st.session_state["sb_age_known"] = True
+        st.session_state["sb_age"] = _meta["age"]
+        _applied.append(f"Age {_meta['age']}")
+    if _meta.get("sex"):
+        st.session_state["sb_sex"] = _meta["sex"]
+        _applied.append(_meta["sex"])
+    if _applied:
+        st.toast(f"DICOM auto-filled: {', '.join(_applied)}")
+    else:
+        st.toast("Clinical context reset to defaults.")
 
 sync_streamlit_theme(st.session_state.theme_mode)
 apply_theme(st.session_state.theme_mode)
@@ -341,13 +369,93 @@ def fetch_server_history(api_url: str, token: str | None, limit: int = 50) -> li
         return None
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_patients(api_url: str, token: str | None, limit: int = 100) -> list | None:
+    """Patient records (metadata + LLM note, images via dedicated endpoints)."""
+    try:
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        r = requests.get(f"{api_url}/patients?limit={limit}", headers=headers, timeout=15)
+        if r.status_code == 200:
+            return r.json().get("items", [])
+        return None
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=600, show_spinner=False)
-def decode_upload_for_display(_raw: bytes, filename: str) -> bytes | None:
+def fetch_patient_file(api_url: str, token: str | None,
+                       request_id: str, kind: str) -> bytes | None:
+    """Fetch archived original ('image') or overlay ('gradcam') bytes."""
+    try:
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        r = requests.get(f"{api_url}/patients/{request_id}/{kind}",
+                         headers=headers, timeout=30)
+        if r.status_code == 200 and r.content:
+            return r.content
+        return None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
+def extract_dicom_metadata(raw: bytes, filename: str) -> dict:
+    """Pull patient demographics embedded in a DICOM file, if present.
+
+    Maps PatientAge (e.g. '058Y', also M/W/D units) to years and PatientSex
+    (M/F/O) to the sidebar labels. Symptoms/context don't exist in standard
+    DICOM tags and always stay manual. Returns {} when nothing usable.
+    """
+    if Path(filename or "").suffix.lower() != ".dcm":
+        return {}
+    try:
+        import pydicom
+
+        ds = pydicom.dcmread(io.BytesIO(raw), force=False, stop_before_pixels=True)
+        meta: dict = {}
+
+        def _tag(*names):
+            for n in names:
+                if n in ds and ds[n].value not in (None, ""):
+                    return str(ds[n].value).strip()
+            return ""
+
+        raw_age = _tag("PatientAge")
+        if raw_age:
+            try:
+                n = int("".join(c for c in raw_age if c.isdigit()) or 0)
+                unit = (raw_age[-1] if raw_age[-1].isalpha() else "Y").upper()
+                years = {"Y": n, "M": n // 12, "W": n // 52, "D": n // 365}.get(unit, n)
+                if 0 < years <= 120:
+                    meta["age"] = years
+            except Exception:
+                pass
+        sex = _tag("PatientSex").upper()
+        if sex == "M":
+            meta["sex"] = "Male"
+        elif sex == "F":
+            meta["sex"] = "Female"
+        elif sex == "O":
+            meta["sex"] = "Other"
+        for key, tag in (("patient_id", "PatientID"), ("study_date", "StudyDate"),
+                         ("modality", "Modality")):
+            val = _tag(tag)
+            if val:
+                meta[key] = val
+        return meta
+    except Exception:
+        return {}
+
+
+def decode_upload_for_display(raw: bytes, filename: str) -> bytes | None:
     """Render the uploaded file to displayable PNG bytes (DICOM-aware).
 
     Mirrors the backend's grayscale normalisation so the "Original" panel
-    matches what the model saw — including DICOM, which browsers can't
+    matches what the model saw - including DICOM, which browsers can't
     preview natively. Returns None when undecodable.
+
+    NOTE: ``raw`` must NOT be underscore-prefixed - Streamlit excludes such
+    params from the cache key, which would serve stale images across uploads.
     """
     import numpy as np
 
@@ -357,7 +465,7 @@ def decode_upload_for_display(_raw: bytes, filename: str) -> bytes | None:
             import pydicom
             from pydicom.pixels import apply_modality_lut, apply_voi_lut
 
-            ds = pydicom.dcmread(io.BytesIO(_raw), force=False)
+            ds = pydicom.dcmread(io.BytesIO(raw), force=False)
             arr = ds.pixel_array.astype(np.float32)
             try:
                 arr = apply_modality_lut(arr, ds).astype(np.float32)
@@ -378,12 +486,23 @@ def decode_upload_for_display(_raw: bytes, filename: str) -> bytes | None:
             gray = ((np.clip((arr - low) / (high - low), 0.0, 1.0)) * 255).astype("uint8")
             img = Image.fromarray(gray, mode="L")
         else:
-            img = Image.open(io.BytesIO(_raw)).convert("L")
+            img = Image.open(io.BytesIO(raw)).convert("L")
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return buf.getvalue()
     except Exception:
         return None
+
+
+def _result_matches_upload(result_bytes: bytes | None) -> bool:
+    """True when the displayed result was computed from the current upload."""
+    up = st.session_state.get(f"cxr_{st.session_state.uploader_key}")
+    if result_bytes is None or up is None:
+        return result_bytes is None and up is None
+    try:
+        return up.getvalue() == result_bytes
+    except Exception:
+        return False
 
 
 def do_login(username: str, password: str) -> tuple[bool, str]:
@@ -417,12 +536,12 @@ def do_login(username: str, password: str) -> tuple[bool, str]:
             return False, "Invalid username or password."
     except requests.RequestException:
         pass
-    # 3) Offline fallback — API unreachable, check local demo credentials
+    # 3) Offline fallback - API unreachable, check local demo credentials
     if username == LOCAL_USER and password == LOCAL_PASS:
         st.session_state.authenticated = True
         st.session_state.token = None
         st.session_state.username = username
-        return True, "API unreachable — signed in offline (demo mode)."
+        return True, "API unreachable - signed in offline (demo mode)."
     if fetch_health(API_URL) is None:
         return False, "API unreachable and local credentials did not match."
     return False, "Invalid username or password."
@@ -433,8 +552,11 @@ def do_logout() -> None:
     st.session_state.token = None
     st.session_state.username = None
     st.session_state.result = None
+    st.session_state.result_bytes = None
     fetch_health.clear()
     fetch_server_history.clear()
+    fetch_patients.clear()
+    fetch_patient_file.clear()
     st.rerun()
 
 
@@ -449,12 +571,12 @@ def health_pill(health: dict | None) -> str:
 def risk_band(probability: float) -> tuple[str, str]:
     """Probability -> (label, pill CSS class)."""
     if probability >= 0.75:
-        return "High model confidence — pneumonia likely", "pill-risk-high"
+        return "High model confidence - pneumonia likely", "pill-risk-high"
     if probability >= 0.5:
-        return "Moderate — leaning pneumonia, review carefully", "pill-risk-mid"
+        return "Moderate - leaning pneumonia, review carefully", "pill-risk-mid"
     if probability >= 0.25:
-        return "Moderate — leaning clear, review carefully", "pill-risk-mid"
-    return "Low model confidence — likely clear", "pill-risk-low"
+        return "Moderate - leaning clear, review carefully", "pill-risk-mid"
+    return "Low model confidence - likely clear", "pill-risk-low"
 
 
 def gauge(probability: float, dark: bool = False):
@@ -482,7 +604,7 @@ def gauge(probability: float, dark: bool = False):
 def _latin(text: object) -> str:
     """Sanitize to latin-1 (fpdf2 core fonts); never crash on LLM unicode."""
     s = str(text or "")
-    for a, b in {"—": "-", "–": "-", "·": "-", "✓": "x", "…": "...",
+    for a, b in {"\u2014": "-", "–": "-", "·": "-", "✓": "x", "…": "...",
                  "→": "->", "←": "<-", """: '"', """: '"',
                  "''": "'", "✔": "x", "⚠": "!", "•": "-"}.items():
         s = s.replace(a, b)
@@ -497,12 +619,12 @@ def build_pdf_report(result: dict, filename: str,
 
     TEAL, NAVY, GRAY = (14, 107, 168), (11, 61, 95), (70, 90, 110)
     prob = float(result.get("probability", 0))
-    pred = str(result.get("prediction", "—"))
-    band = ("High model confidence — pneumonia likely", (192, 57, 43)) \
+    pred = str(result.get("prediction", "N/A"))
+    band = ("High model confidence - pneumonia likely", (192, 57, 43)) \
         if prob >= 0.75 else \
-        (("Moderate — leaning pneumonia", (176, 121, 14)) if prob >= 0.5 else
-         (("Moderate — leaning clear", (176, 121, 14)) if prob >= 0.25 else
-          ("Low model confidence — likely clear", (30, 132, 73))))
+        (("Moderate - leaning pneumonia", (176, 121, 14)) if prob >= 0.5 else
+         (("Moderate - leaning clear", (176, 121, 14)) if prob >= 0.25 else
+          ("Low model confidence - likely clear", (30, 132, 73))))
     summary = result.get("clinical_summary", {}) or {}
     ctx = summary.get("clinical_context", {}) or {}
 
@@ -512,7 +634,7 @@ def build_pdf_report(result: dict, filename: str,
             self.set_font("Helvetica", "I", 8)
             self.set_text_color(*GRAY)
             self.cell(0, 10, _latin(
-                "AI assistance only — not a diagnosis. "
+                "AI assistance only - not a diagnosis. "
                 "Review by a qualified physician required.  "
                 f"Page {self.page_no()}/{{nb}}"), align="C")
 
@@ -597,15 +719,22 @@ def build_pdf_report(result: dict, filename: str,
             return width_mm  # square fallback
 
     section("1. Patient context")
+    dicom_meta = result.get("dicom_metadata") or {}
+    if dicom_meta.get("patient_id"):
+        kv("Patient ID", dicom_meta["patient_id"])
+    if dicom_meta.get("study_date"):
+        kv("Study date", dicom_meta["study_date"])
+    if dicom_meta.get("modality"):
+        kv("Modality", dicom_meta["modality"])
     kv("Age", ctx.get("age") or "Not specified")
     kv("Sex", ctx.get("sex") or "Not specified")
-    kv("Symptoms", ctx.get("symptoms") or "—")
-    kv("Additional context", ctx.get("context") or "—")
+    kv("Symptoms", ctx.get("symptoms") or "N/A")
+    kv("Additional context", ctx.get("context") or "N/A")
 
     section("2. Model result")
     kv("Prediction", pred)
     kv("Pneumonia probability", f"{prob:.2%}")
-    kv("Inference time", f"{result.get('inference_ms', '—')} ms")
+    kv("Inference time", f"{result.get('inference_ms', 'N/A')} ms")
     kv("Model", f"{result.get('model_version')} (threshold {result.get('threshold', 0.5)})")
     kv("Request ID", result.get("request_id"))
 
@@ -655,13 +784,17 @@ def build_pdf_report(result: dict, filename: str,
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def blend_gradcam(_original_png: bytes, _heatmap_png: bytes, alpha: float) -> bytes | None:
-    """Legacy global re-blend (used only when the server sent no mask)."""
+def blend_gradcam(original_png: bytes, heatmap_png: bytes, alpha: float) -> bytes | None:
+    """Legacy global re-blend (used only when the server sent no mask).
+
+    NOTE: params must NOT be underscore-prefixed - Streamlit would exclude
+    them from the cache key and serve blends from previous analyses.
+    """
     import numpy as np
 
     try:
-        orig = Image.open(io.BytesIO(_original_png)).convert("RGB")
-        heat = Image.open(io.BytesIO(_heatmap_png)).convert("RGB").resize(
+        orig = Image.open(io.BytesIO(original_png)).convert("RGB")
+        heat = Image.open(io.BytesIO(heatmap_png)).convert("RGB").resize(
             orig.size, Image.BILINEAR)
         blended = Image.fromarray(
             (np.asarray(orig, dtype=np.float32) * (1.0 - alpha)
@@ -674,21 +807,24 @@ def blend_gradcam(_original_png: bytes, _heatmap_png: bytes, alpha: float) -> by
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def blend_gradcam_masked(_original_png: bytes, _heatmap_png: bytes,
-                         _mask_png: bytes, alpha: float) -> bytes | None:
+def blend_gradcam_masked(original_png: bytes, heatmap_png: bytes,
+                         mask_png: bytes, alpha: float) -> bytes | None:
     """Masked re-blend: the uploaded radiograph stays intact, heat paints
     ONLY where the model responded (per-pixel alpha = mask × intensity).
 
     At 0% the output is pixel-identical to the upload; raising the slider
     reveals hot regions without ever tinting cold anatomy purple.
+
+    NOTE: params must NOT be underscore-prefixed - Streamlit would exclude
+    them from the cache key and serve blends from previous analyses.
     """
     import numpy as np
 
     try:
-        orig = Image.open(io.BytesIO(_original_png)).convert("RGB")
-        heat = Image.open(io.BytesIO(_heatmap_png)).convert("RGB").resize(
+        orig = Image.open(io.BytesIO(original_png)).convert("RGB")
+        heat = Image.open(io.BytesIO(heatmap_png)).convert("RGB").resize(
             orig.size, Image.BILINEAR)
-        mask = Image.open(io.BytesIO(_mask_png)).convert("L").resize(
+        mask = Image.open(io.BytesIO(mask_png)).convert("L").resize(
             orig.size, Image.BILINEAR)
         m = (np.asarray(mask, dtype=np.float32) / 255.0)[..., None] * float(alpha)
         out = (np.asarray(orig, dtype=np.float32) * (1.0 - m)
@@ -732,7 +868,7 @@ def evidence_panel(original_png: bytes | None, gradcam_raw: bytes | None,
             blended = blend_gradcam(original_png, heatmap_raw, intensity / 100.0)
         if blended is not None:
             overlay_png = blended
-            st.caption(f"Overlay at {intensity}% on the uploaded image — "
+            st.caption(f"Overlay at {intensity}% on the uploaded image - "
                        "drag to examine hot regions against the anatomy.")
     if view == "Overlay only":
         if overlay_png is not None:
@@ -767,7 +903,7 @@ def evidence_panel(original_png: bytes | None, gradcam_raw: bytes | None,
             else:
                 st.info("Grad-CAM was not returned by the API.")
     st.caption("Warm regions influenced the model most. "
-               "Grad-CAM is explanatory — not a validated lesion localizer.")
+               "Grad-CAM is explanatory - not a validated lesion localizer.")
     dl1, dl2 = st.columns(2)
     with dl1:
         if original_png is not None:
@@ -830,7 +966,7 @@ if not st.session_state.authenticated:
         st.markdown(health_pill(fetch_health(API_URL)), unsafe_allow_html=True)
         st.markdown(
             """<div class="disclaimer"><b>Safety first.</b> Predictions and Grad-CAM
-            are model outputs — never a standalone diagnosis.</div>""",
+            are model outputs - never a standalone diagnosis.</div>""",
             unsafe_allow_html=True,
         )
     st.markdown('<div class="footer">ClinVision AI · educational prototype · not a medical device</div>',
@@ -868,19 +1004,20 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Sidebar — reorganised: 1 Patient · 2 Display · 3 Session
+# Sidebar - reorganised: 1 Patient · 2 Display · 3 Session
 with st.sidebar:
     st.header(f"{ic('context')} 1 · Patient context")
-    st.caption("Context appears in the summary only — it never changes the vision model.")
-    age_known = st.checkbox("Patient age known", value=False)
+    st.caption("Context appears in the summary only - it never changes the vision model.")
+    age_known = st.checkbox("Patient age known", value=False, key="sb_age_known")
     age = st.number_input("Age", min_value=0, max_value=120, value=30,
-                          disabled=not age_known)
-    sex = st.selectbox("Sex", ["Not specified", "Female", "Male", "Other"])
+                          disabled=not age_known, key="sb_age")
+    sex = st.selectbox("Sex", ["Not specified", "Female", "Male", "Other"],
+                       key="sb_sex")
     symptoms = st.text_area("Symptoms", placeholder="e.g. cough, fever, dyspnea",
-                            height=70, max_chars=500)
+                            height=70, max_chars=500, key="sb_symptoms")
     context = st.text_area("Additional context",
                            placeholder="History, onset, comorbidities…",
-                           height=70, max_chars=500)
+                           height=70, max_chars=500, key="sb_context")
     st.divider()
     st.subheader(f"{ic('theme')} 2 · Display")
     theme_choice = st.selectbox(
@@ -911,6 +1048,7 @@ with st.sidebar:
         if st.button(f"{ic('clear')} Clear", use_container_width=True,
                      help="Clear result and uploaded file"):
             st.session_state.result = None
+            st.session_state.result_bytes = None
             st.session_state.uploader_key += 1
             st.rerun()
 
@@ -920,10 +1058,59 @@ tab_analyze, tab_history, tab_about = st.tabs(
 
 with tab_analyze:
     result = st.session_state.get("result")
-    # Stepper first: it is the section map, then the staged content follows.
-    if result:
+    result_bytes = st.session_state.get("result_bytes")
+    synced = _result_matches_upload(result_bytes)
+
+    with st.container(border=True):
+        st.subheader(f"{ic('upload')} Step 1 · Upload chest X-ray")
+        st.caption("Uploading a new file **replaces** the previous one: "
+                   "its analysis display is cleared automatically.")
+        uploaded = st.file_uploader(
+            "DICOM, JPG or PNG",
+            type=["dcm", "jpg", "jpeg", "png"],
+            key=f"cxr_{st.session_state.uploader_key}",
+            help=f"Max {MAX_UPLOAD_MB} MB. DICOM gets modality/VOI LUT preprocessing.")
+
+    # Replace-not-add: a different file clears the previous analysis display
+    # (metrics, Grad-CAM, summary, evidence) instead of stacking below it.
+    if uploaded is not None:
+        _sig = (uploaded.name, uploaded.size,
+                hashlib.md5(uploaded.getvalue()).hexdigest())
+        if st.session_state.get("upload_sig") != _sig:
+            st.session_state.upload_sig = _sig
+            st.session_state.result = None
+            st.session_state.result_filename = None
+            st.session_state.result_bytes = None
+            st.session_state.pop("_evidence_original", None)
+            st.session_state.pop("_evidence_gradcam", None)
+            result = None
+            result_bytes = None
+            synced = False
+            # New file = new patient: queue a full context reset, refilled
+            # from DICOM tags when the file provides them, then refresh so
+            # the reset applies before the sidebar widgets instantiate.
+            meta = (extract_dicom_metadata(uploaded.getvalue(), uploaded.name)
+                    if uploaded.name.lower().endswith(".dcm") else {})
+            st.session_state.pending_context = {"meta": meta}
+            st.rerun()
+    else:
+        # No file (fresh load or removed via the uploader X): nothing to
+        # analyze and nothing to show - the area stays fully empty.
+        st.session_state.upload_sig = None
+        st.session_state.result = None
+        st.session_state.result_filename = None
+        st.session_state.result_bytes = None
+        st.session_state.pop("_evidence_original", None)
+        st.session_state.pop("_evidence_gradcam", None)
+        result = None
+        result_bytes = None
+        synced = True
+
+    # Stepper reflects the state AFTER replace-detection above, so swapping
+    # the file immediately drops step 3 in the same run.
+    if result and synced:
         step_cls = ["done", "done", "active"]
-    elif st.session_state.get(f"cxr_{st.session_state.uploader_key}") is not None:
+    elif uploaded is not None:
         step_cls = ["done", "active", ""]
     else:
         step_cls = ["active", "", ""]
@@ -935,14 +1122,6 @@ with tab_analyze:
         </div>""",
         unsafe_allow_html=True,
     )
-
-    with st.container(border=True):
-        st.subheader(f"{ic('upload')} Step 1 · Upload chest X-ray")
-        uploaded = st.file_uploader(
-            "DICOM, JPG or PNG",
-            type=["dcm", "jpg", "jpeg", "png"],
-            key=f"cxr_{st.session_state.uploader_key}",
-            help=f"Max {MAX_UPLOAD_MB} MB. DICOM gets modality/VOI LUT preprocessing.")
 
     if uploaded:
         raw_bytes = uploaded.getvalue()
@@ -957,16 +1136,31 @@ with tab_analyze:
                              use_container_width=True)
                     if uploaded.name.lower().endswith(".dcm"):
                         st.caption("DICOM decoded locally with modality + VOI LUT handling.")
+                        meta = extract_dicom_metadata(raw_bytes, uploaded.name)
+                        meta_bits = []
+                        if meta.get("patient_id"):
+                            meta_bits.append(f"Patient ID: {meta['patient_id']}")
+                        if meta.get("study_date"):
+                            meta_bits.append(f"Study: {meta['study_date']}")
+                        if meta.get("modality"):
+                            meta_bits.append(f"Modality: {meta['modality']}")
+                        if meta_bits:
+                            st.caption(" · ".join(meta_bits))
+                            st.caption("Age/Sex auto-filled the sidebar when empty. "
+                                       "Symptoms and context have no DICOM tags - enter them manually.")
+                        else:
+                            st.caption("No usable demographics in this file - "
+                                       "fill the sidebar manually.")
                 else:
-                    st.warning("Preview unavailable — the API will still try to decode the file.")
+                    st.warning("Preview unavailable - the API will still try to decode the file.")
         with prev_r:
             with st.container(border=True):
                 st.subheader(f"{ic('run')} Step 2 · Run analysis")
                 st.caption("Calls `POST /analyze`: prediction + Grad-CAM + summary in one request.")
                 ctx_bits = [
-                    f"Age: {age if age_known else '—'}",
+                    f"Age: {age if age_known else 'N/A'}",
                     f"Sex: {sex}",
-                    f"Symptoms: {ic('check') if symptoms.strip() else '—'}",
+                    f"Symptoms: {ic('check') if symptoms.strip() else 'N/A'}",
                 ]
                 st.caption(" · ".join(ctx_bits))
                 run = st.button(f"{ic('go')} Analyze image", type="primary",
@@ -988,7 +1182,7 @@ with tab_analyze:
                                          data=payload, headers=api_headers(), timeout=180)
                     if resp.status_code == 401:
                         s.update(label="Session expired", state="error")
-                        st.error("Session expired — please log in again.")
+                        st.error("Session expired - please log in again.")
                         do_logout()
                         st.stop()
                     resp.raise_for_status()
@@ -997,6 +1191,7 @@ with tab_analyze:
                     s.update(label="Analysis complete", state="complete")
                 st.session_state.result = result
                 st.session_state.result_filename = uploaded.name
+                st.session_state.result_bytes = raw_bytes
                 st.session_state.session_history.insert(0, {
                     "time": datetime.now().strftime("%H:%M:%S"),
                     "file": uploaded.name,
@@ -1010,9 +1205,15 @@ with tab_analyze:
                 st.error(f"Invalid API response: {exc}")
 
     result = st.session_state.get("result")
+    result_bytes = st.session_state.get("result_bytes")
+    synced = _result_matches_upload(result_bytes)
+    if result and not synced:
+        st.warning("The uploaded file changed since this analysis - the results "
+                   "below belong to the previously analyzed image. Press "
+                   "**Analyze image** to update them.")
     if result:
         prob = float(result.get("probability", 0))
-        pred = result.get("prediction", "—")
+        pred = result.get("prediction", "N/A")
         band_label, band_cls = risk_band(prob)
         with st.container(border=True):
             st.subheader(f"{ic('result')} Step 3 · Model result")
@@ -1021,16 +1222,23 @@ with tab_analyze:
             m1, m2, m3 = st.columns(3)
             m1.metric("Prediction", pred)
             m2.metric("Pneumonia probability", f"{prob:.1%}")
-            m3.metric("Inference time", f"{result.get('inference_ms', '—')} ms")
+            m3.metric("Inference time", f"{result.get('inference_ms', 'N/A')} ms")
             st.plotly_chart(gauge(prob, dark=theme_is_dark()),
                             use_container_width=True)
             st.caption(f"Request `{result.get('request_id')}` · "
                        f"model `{result.get('model_version')}` · "
                        f"threshold `{result.get('threshold', 0.5)}`")
 
-        # Visual evidence — full width: Original vs Grad-CAM comparison.
+        # Visual evidence - full width: Original vs Grad-CAM comparison.
         with st.container(border=True):
             st.subheader(f"{ic('compare')} Visual evidence · Original vs Grad-CAM")
+            dicom_meta = result.get("dicom_metadata") or {}
+            if dicom_meta:
+                st.caption(" · ".join(
+                    f"{k}: {v}" for k, v in
+                    (("Patient ID", dicom_meta.get("patient_id")),
+                     ("Study", dicom_meta.get("study_date")),
+                     ("Modality", dicom_meta.get("modality"))) if v))
             enc = result.get("gradcam_png_base64")
             gradcam_raw = base64.b64decode(enc) if enc else None
             enc_h = result.get("gradcam_heatmap_base64")
@@ -1040,13 +1248,18 @@ with tab_analyze:
             if enc is None and result.get("gradcam_error"):
                 st.caption(result["gradcam_error"])
             fname = st.session_state.get("result_filename") or "image"
-            # Re-decode the original from the uploader when available so the
-            # comparison always pairs the right image with its overlay.
-            up = st.session_state.get(f"cxr_{st.session_state.uploader_key}")
-            orig_for_evidence = (
-                decode_upload_for_display(up.getvalue(), up.name)
-                if up is not None else None
-            )
+            # Synchronization: the Original panel ALWAYS decodes the exact
+            # bytes that were analyzed (result_bytes), never the current
+            # uploader content - overlay and original can never drift apart.
+            if result_bytes is not None:
+                orig_for_evidence = decode_upload_for_display(
+                    result_bytes, fname)
+            else:
+                up = st.session_state.get(f"cxr_{st.session_state.uploader_key}")
+                orig_for_evidence = (
+                    decode_upload_for_display(up.getvalue(), up.name)
+                    if up is not None else None
+                )
             displayed = evidence_panel(orig_for_evidence, gradcam_raw,
                                            heatmap_raw, mask_raw, fname)
             # Export exactly what is on screen: the masked blend at the
@@ -1066,7 +1279,7 @@ with tab_analyze:
                             '(no LLM)</span>', unsafe_allow_html=True)
             st.write(summary.get("summary", "No summary available."))
             st.caption(
-                f"Assessment: **{summary.get('assessment', '—')}** · "
+                f"Assessment: **{summary.get('assessment', 'N/A')}** · "
                 f"Probability: **{float(summary.get('model_probability', prob)):.1%}** · "
                 f"Source: **{summary.get('llm_provider', 'template')}**"
             )
@@ -1096,6 +1309,112 @@ with tab_analyze:
 
 with tab_history:
     with st.container(border=True):
+        st.subheader(f"{ic('folder')} Patient records (SQLite archive)")
+        st.caption("Each analysis archives the DICOM/photo, patient info "
+                   "(age, sex, symptoms, context) and the LLM summary. "
+                   "Local demo storage only.")
+        p1, p2 = st.columns(2)
+        with p1:
+            if st.button(f"{ic('refresh')} Refresh records", use_container_width=True,
+                         key="refresh_patients"):
+                fetch_patients.clear()
+                st.rerun()
+        with p2:
+            confirm_all = st.checkbox("Confirm clear all", value=False,
+                                      key="confirm_clear_patients")
+            if st.button(f"{ic('delete')} Clear all records", use_container_width=True,
+                         disabled=not confirm_all, key="clear_patients"):
+                try:
+                    r = requests.delete(f"{API_URL}/patients",
+                                        headers=api_headers(), timeout=20)
+                    if r.status_code == 200:
+                        fetch_patients.clear()
+                        st.success("Patient records cleared.")
+                        st.rerun()
+                    elif r.status_code == 401:
+                        st.error("Session expired - please log in again.")
+                        do_logout()
+                    else:
+                        st.error(f"Clear failed (HTTP {r.status_code}).")
+                except requests.RequestException as exc:
+                    st.error(f"Clear failed: {exc}")
+        records = fetch_patients(API_URL, st.session_state.get("token"))
+        if records:
+            table = [{
+                "Date": datetime.fromtimestamp(p.get("timestamp", 0)).strftime("%Y-%m-%d %H:%M"),
+                "File": p.get("filename"),
+                "Patient ID": (p.get("patient_id") or "N/A")[:8],
+                "Prediction": p.get("prediction"),
+                "Probability": f"{float(p.get('probability', 0)):.1%}",
+                "Age": p.get("age") or "N/A",
+                "Sex": p.get("sex") or "N/A",
+                "LLM": p.get("llm_provider") or "template",
+            } for p in records]
+            st.dataframe(table, use_container_width=True, hide_index=True)
+            labels = {f"{t['Date']} · {t['File']} · {t['Prediction']}": p["request_id"]
+                      for t, p in zip(table, records)}
+            chosen = st.selectbox(f"{ic('folder')} Open record", list(labels),
+                                  key="patient_record_select")
+            rec = next(p for p in records if p["request_id"] == labels[chosen])
+            d1, d2, d3 = st.columns(3)
+            d1.metric("Prediction", rec.get("prediction"))
+            d2.metric("Probability", f"{float(rec.get('probability', 0)):.1%}")
+            d3.metric("Model", rec.get("model_version") or "N/A")
+            st.caption(
+                f"Age: **{rec.get('age') or 'N/A'}** · Sex: **{rec.get('sex') or 'N/A'}** · "
+                f"Symptoms: **{rec.get('symptoms') or 'N/A'}** · "
+                f"Context: **{rec.get('context') or 'N/A'}**"
+            )
+            if rec.get("patient_id") or rec.get("study_date") or rec.get("modality"):
+                st.caption(" · ".join(
+                    f"{k}: **{v}**" for k, v in
+                    (("Patient ID", rec.get("patient_id")),
+                     ("Study", rec.get("study_date")),
+                     ("Modality", rec.get("modality"))) if v))
+            tok = st.session_state.get("token")
+            img_bytes = fetch_patient_file(API_URL, tok, rec["request_id"], "image")
+            cam_bytes = fetch_patient_file(API_URL, tok, rec["request_id"], "gradcam")
+            if img_bytes is not None and (rec.get("filename") or "").lower().endswith(".dcm"):
+                img_bytes = decode_upload_for_display(img_bytes, rec.get("filename") or "x.dcm")
+            i1, i2 = st.columns(2)
+            with i1:
+                st.markdown('<div class="evidence-label">Archived image</div>',
+                            unsafe_allow_html=True)
+                if img_bytes:
+                    st.image(img_bytes, caption=rec.get("filename"),
+                             use_container_width=True)
+                else:
+                    st.caption("Image unavailable.")
+            with i2:
+                st.markdown('<div class="evidence-label">Archived Grad-CAM</div>',
+                            unsafe_allow_html=True)
+                if cam_bytes:
+                    st.image(cam_bytes, caption="Model attention overlay",
+                             use_container_width=True)
+                else:
+                    st.caption("No Grad-CAM archived.")
+            st.markdown("**LLM summary** "
+                        f"(`{rec.get('llm_provider') or 'template'}`)")
+            st.write(rec.get("summary") or "N/A")
+            if st.button(f"{ic('delete')} Delete this record", key="del_patient"):
+                try:
+                    r = requests.delete(f"{API_URL}/patients/{rec['request_id']}",
+                                        headers=api_headers(), timeout=15)
+                    if r.status_code == 200:
+                        fetch_patients.clear()
+                        fetch_patient_file.clear()
+                        st.success("Record deleted.")
+                        st.rerun()
+                    else:
+                        st.error(f"Delete failed (HTTP {r.status_code}).")
+                except requests.RequestException as exc:
+                    st.error(f"Delete failed: {exc}")
+        elif records == []:
+            st.caption("No patient records yet - run an analysis first.")
+        else:
+            st.caption("Records unavailable (API offline or unauthorized).")
+
+    with st.container(border=True):
         st.subheader(f"{ic('history')} Session history (this login)")
         if st.session_state.session_history:
             st.dataframe(st.session_state.session_history,
@@ -1105,7 +1424,7 @@ with tab_history:
 
     with st.container(border=True):
         st.subheader(f"{ic('server')} Server history (shared demo SQLite)")
-        st.caption("Stored without patient identifiers — request id, class and probability only.")
+        st.caption("Stored without patient identifiers - request id, class and probability only.")
         h1, h2 = st.columns(2)
         with h1:
             if st.button(f"{ic('refresh')} Refresh history", use_container_width=True):
@@ -1124,7 +1443,7 @@ with tab_history:
                         st.success("Server history cleared.")
                         st.rerun()
                     elif r.status_code == 401:
-                        st.error("Session expired — please log in again.")
+                        st.error("Session expired - please log in again.")
                         do_logout()
                     else:
                         st.error(f"Clear failed (HTTP {r.status_code}).")
@@ -1141,7 +1460,7 @@ with tab_history:
 with tab_about:
     with st.container(border=True):
         st.subheader(f"{ic('how')} How it works")
-        st.markdown("1. **DICOM-aware preprocessing** — modality/VOI LUT, MONOCHROME1 "
+        st.markdown("1. **DICOM-aware preprocessing** - modality/VOI LUT, MONOCHROME1 "
                     "handling, percentile normalisation, resize to 320×320.\n"
                     "2. **DenseNet121 classifier** (ImageNet transfer learning) → "
                     "pneumonia probability.\n"
@@ -1159,5 +1478,5 @@ with tab_about:
                    "Hugging Face (`HF_API_KEY`). Without any of these the API safely "
                    "falls back to the deterministic template summary.")
 
-st.markdown('<div class="footer">ClinVision AI — AI-assisted prototype · not a medical device · © 2026</div>',
+st.markdown('<div class="footer">ClinVision AI - AI-assisted prototype · not a medical device · © 2026</div>',
             unsafe_allow_html=True)

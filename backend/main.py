@@ -1,5 +1,5 @@
 """
-ClinVision AI — FastAPI inference service.
+ClinVision AI - FastAPI inference service.
 
 ML workflow lives in ClinVision_AI_RSNA.ipynb; this module contains only
 production-facing inference logic (preprocessing, model serving, Grad-CAM,
@@ -30,7 +30,7 @@ import tensorflow as tf
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from PIL import Image
 from pydantic import BaseModel
@@ -50,6 +50,7 @@ IMAGE_SIZE = int(os.getenv("IMAGE_SIZE", "320"))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 DB_PATH = ROOT / "artifacts" / "history.sqlite3"
+PATIENT_IMG_DIR = ROOT / "artifacts" / "patient_images"
 ALLOWED_EXTENSIONS = {".dcm", ".jpg", ".jpeg", ".png"}
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -63,7 +64,7 @@ REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "false").strip().lower() in {"1", "true
 AUTH_TOKEN_TTL_SECONDS = int(os.getenv("AUTH_TOKEN_TTL_HOURS", "12")) * 3600
 
 # --- FREE LLM configuration (all optional, tried in order) -------------------
-# 1) Ollama (100% free, local, no API key) — recommended
+# 1) Ollama (100% free, local, no API key) - recommended
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2").strip()
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT_S", "60"))
@@ -82,7 +83,7 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
 LLM_MODEL = os.getenv("LLM_MODEL", "").strip()
 
 # -----------------------------------------------------------------------------
-# App lifespan — preload model + init DB once
+# App lifespan - preload model + init DB once
 # -----------------------------------------------------------------------------
 MODEL = None
 _TOKENS: dict[str, float] = {}  # token -> expiry epoch
@@ -113,6 +114,7 @@ def init_history() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_history()
+    init_patient_history()
     try:
         get_model()
         logger.info("Model preloaded OK (%s)", MODEL_VERSION)
@@ -139,7 +141,7 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 
 # -----------------------------------------------------------------------------
-# Auth — simple demo token auth for the doctor portal
+# Auth - simple demo token auth for the doctor portal
 # -----------------------------------------------------------------------------
 class LoginRequest(BaseModel):
     username: str = ""
@@ -198,7 +200,7 @@ async def login(
 ) -> JSONResponse:
     """Doctor login. Accepts form fields OR a JSON body {username, password}."""
     # FastAPI Form defaults make JSON bodies fail validation, so also try JSON manually.
-    # When called with JSON, Form(...) still yields "" — fall back to request body.
+    # When called with JSON, Form(...) still yields "" - fall back to request body.
     if not username and not password:
         # This branch is reached via JSON only when using the raw endpoint below.
         pass
@@ -384,7 +386,7 @@ def build_template_summary(
 
 LLM_ROLE = (
     "You are 'ClinVision Assistant', a senior radiology copilot assisting a "
-    "licensed physician. You explain, structure and contextualize — you NEVER "
+    "licensed physician. You explain, structure and contextualize - you NEVER "
     "diagnose, prescribe, order procedures, or replace clinical judgment."
 )
 
@@ -440,7 +442,7 @@ def split_llm_sections(text: str) -> list[tuple[str, str]]:
 
 
 def _call_ollama(prompt: str) -> Optional[str]:
-    """Ollama local LLM — 100% free, no API key (http://localhost:11434)."""
+    """Ollama local LLM - 100% free, no API key (http://localhost:11434)."""
     try:
         r = requests.post(
             f"{OLLAMA_BASE_URL}/api/generate",
@@ -531,7 +533,7 @@ def maybe_llm_summary(summary_payload: dict) -> dict:
     generated: Optional[str] = None
     provider = "template"
 
-    # 1) Ollama — free & local, no key required
+    # 1) Ollama - free & local, no key required
     generated = _call_ollama(prompt)
     if generated:
         provider = f"ollama:{OLLAMA_MODEL}"
@@ -573,7 +575,7 @@ def maybe_llm_summary(summary_payload: dict) -> dict:
 
 
 # -----------------------------------------------------------------------------
-# Demo history — no real patient data should be stored here.
+# Demo history - no real patient data should be stored here.
 # -----------------------------------------------------------------------------
 def record_history(request_id: str, predicted_class: str, probability: float) -> None:
     init_history()
@@ -598,6 +600,141 @@ def read_history(limit: int = 50) -> list[dict]:
 
 
 # -----------------------------------------------------------------------------
+# Patient records - full analysis archive (image + context + LLM note).
+# Local demo storage only; never commit real patient data.
+# -----------------------------------------------------------------------------
+PATIENT_COLUMNS = (
+    "request_id, timestamp, filename, image_path, gradcam_path, patient_id, "
+    "study_date, modality, age, sex, "
+    "symptoms, context, prediction, probability, model_version, inference_ms, "
+    "summary, llm_provider, llm_enabled"
+)
+
+
+def extract_dicom_tags(raw: bytes) -> dict:
+    """Pull archive-worthy identifiers from a DICOM file ({} otherwise)."""
+    try:
+        ds = pydicom.dcmread(io.BytesIO(raw), force=False, stop_before_pixels=True)
+        out: dict = {}
+        for key, tag in (("patient_id", "PatientID"), ("study_date", "StudyDate"),
+                         ("modality", "Modality")):
+            if tag in ds and ds[tag].value not in (None, ""):
+                out[key] = str(ds[tag].value).strip()
+        return out
+    except Exception:
+        return {}
+
+
+def init_patient_history() -> None:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PATIENT_IMG_DIR.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS patient_history ("
+            "request_id TEXT PRIMARY KEY, timestamp REAL, filename TEXT, "
+            "image_path TEXT, gradcam_path TEXT, patient_id TEXT, "
+            "study_date TEXT, modality TEXT, age TEXT, sex TEXT, "
+            "symptoms TEXT, context TEXT, prediction TEXT, probability REAL, "
+            "model_version TEXT, inference_ms REAL, summary TEXT, "
+            "llm_provider TEXT, llm_enabled INTEGER)"
+        )
+        # Migrate older DBs that lack the DICOM identifier columns.
+        existing = {row[1] for row in
+                    connection.execute("PRAGMA table_info(patient_history)").fetchall()}
+        for column in ("patient_id TEXT", "study_date TEXT", "modality TEXT"):
+            if column.split()[0] not in existing:
+                connection.execute(f"ALTER TABLE patient_history ADD COLUMN {column}")
+        connection.commit()
+
+
+def _safe_suffix(filename: str) -> str:
+    suffix = Path(filename or "").suffix.lower()
+    return suffix if suffix in ALLOWED_EXTENSIONS else ".bin"
+
+
+def record_patient(request_id: str, raw: bytes, filename: str, age: str,
+                   sex: str, symptoms: str, context: str, result: dict,
+                   clinical_summary: dict, dicom_meta: Optional[dict] = None) -> None:
+    """Persist one full analysis: files on disk, metadata + LLM note in SQLite.
+
+    Never breaks the analysis itself - all failures are logged, not raised.
+    """
+    try:
+        init_patient_history()
+        suffix = _safe_suffix(filename)
+        image_name = f"{request_id}{suffix}"
+        (PATIENT_IMG_DIR / image_name).write_bytes(raw)
+        gradcam_name: Optional[str] = None
+        encoded = result.get("gradcam_png_base64")
+        if encoded:
+            try:
+                gradcam_name = f"{request_id}_gradcam.png"
+                (PATIENT_IMG_DIR / gradcam_name).write_bytes(base64.b64decode(encoded))
+            except Exception as exc:
+                logger.warning("Grad-CAM archive failed for %s: %s", request_id, exc)
+                gradcam_name = None
+        dicom_meta = dicom_meta or {}
+        with sqlite3.connect(DB_PATH) as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO patient_history "
+                f"({PATIENT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (request_id, time.time(), filename or "image", image_name, gradcam_name,
+                 dicom_meta.get("patient_id", ""), dicom_meta.get("study_date", ""),
+                 dicom_meta.get("modality", ""),
+                 age or "", sex or "", symptoms or "", context or "",
+                 result.get("prediction"), float(result.get("probability", 0.0)),
+                 result.get("model_version"), float(result.get("inference_ms", 0.0)),
+                 (clinical_summary or {}).get("summary", ""),
+                 (clinical_summary or {}).get("llm_provider", "template"),
+                 1 if (clinical_summary or {}).get("llm_enabled") else 0),
+            )
+            connection.commit()
+    except Exception as exc:
+        logger.warning("Patient archive failed for %s: %s", request_id, exc)
+
+
+def read_patients(limit: int = 50, offset: int = 0) -> list[dict]:
+    init_patient_history()
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            f"SELECT {PATIENT_COLUMNS} FROM patient_history "
+            "ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+            (max(1, min(limit, 500)), max(0, offset)),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def read_patient(request_id: str) -> Optional[dict]:
+    init_patient_history()
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            f"SELECT {PATIENT_COLUMNS} FROM patient_history WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_patient(request_id: str) -> bool:
+    init_patient_history()
+    record = read_patient(request_id)
+    if record is None:
+        return False
+    for key in ("image_path", "gradcam_path"):
+        name = record.get(key)
+        if name:
+            try:
+                (PATIENT_IMG_DIR / Path(name).name).unlink(missing_ok=True)
+            except Exception as exc:
+                logger.warning("Could not delete archived file %s: %s", name, exc)
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute("DELETE FROM patient_history WHERE request_id = ?", (request_id,))
+        connection.commit()
+    return True
+
+
+# -----------------------------------------------------------------------------
 # API endpoints
 # -----------------------------------------------------------------------------
 @app.get("/")
@@ -607,7 +744,7 @@ def root() -> dict:
         "version": MODEL_VERSION,
         "docs": "/docs",
         "endpoints": ["/health", "/auth/login", "/predict", "/explain", "/summary",
-                      "/analyze", "/history", "/llm/status"],
+                      "/analyze", "/history", "/patients", "/llm/status"],
     }
 
 
@@ -660,10 +797,12 @@ async def _read_upload(file: UploadFile) -> bytes:
     return raw
 
 
-async def _predict_internal(file: UploadFile, include_gradcam: bool = False) -> dict:
+async def _predict_internal(file: UploadFile, include_gradcam: bool = False,
+                             raw: Optional[bytes] = None) -> dict:
     request_id = str(uuid.uuid4())
     start = time.perf_counter()
-    raw = await _read_upload(file)
+    if raw is None:
+        raw = await _read_upload(file)
     try:
         model = get_model()
         input_batch, original = bytes_to_model_input(raw, file.filename or "image")
@@ -741,10 +880,79 @@ async def analyze(
     context: str = Form(""),
     _user: Optional[str] = Depends(require_user_if_enabled),
 ) -> JSONResponse:
-    result = await _predict_internal(file, include_gradcam=True)
+    raw = await _read_upload(file)  # read once: reused for inference + archive
+    result = await _predict_internal(file, include_gradcam=True, raw=raw)
     summary_payload = build_template_summary(result["probability"], age, sex, symptoms, context)
     result["clinical_summary"] = maybe_llm_summary(summary_payload)
+    dicom_meta = (extract_dicom_tags(raw)
+                  if _safe_suffix(file.filename or "") == ".dcm" else {})
+    result["dicom_metadata"] = dicom_meta
+    record_patient(result["request_id"], raw, file.filename or "image",
+                   age, sex, symptoms, context, result, result["clinical_summary"],
+                   dicom_meta)
     return JSONResponse(result)
+
+
+@app.get("/patients")
+def list_patients(limit: int = 50, offset: int = 0,
+                  _user: Optional[str] = Depends(require_user_if_enabled)) -> dict:
+    items = read_patients(limit, offset)
+    return {"items": items, "limit": limit, "offset": offset}
+
+
+@app.get("/patients/{request_id}")
+def get_patient(request_id: str,
+                _user: Optional[str] = Depends(require_user_if_enabled)) -> JSONResponse:
+    record = read_patient(request_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Patient record not found.")
+    return JSONResponse(record)
+
+
+def _patient_file(request_id: str, field: str, media_type: str) -> FileResponse:
+    record = read_patient(request_id)
+    if record is None or not record.get(field):
+        raise HTTPException(status_code=404, detail="File not found.")
+    path = PATIENT_IMG_DIR / Path(record[field]).name  # stay inside archive dir
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="File not found.")
+    return FileResponse(path, media_type=media_type,
+                        filename=record.get("filename") or path.name)
+
+
+@app.get("/patients/{request_id}/image")
+def get_patient_image(request_id: str,
+                      _user: Optional[str] = Depends(require_user_if_enabled)) -> FileResponse:
+    record = read_patient(request_id)
+    suffix = _safe_suffix((record or {}).get("filename", ""))
+    media = {"dcm": "application/dicom"}.get(suffix.lstrip("."), "image/png")
+    if suffix == ".dcm":
+        return _patient_file(request_id, "image_path", "application/dicom")
+    if suffix in (".jpg", ".jpeg"):
+        return _patient_file(request_id, "image_path", "image/jpeg")
+    return _patient_file(request_id, "image_path", media)
+
+
+@app.get("/patients/{request_id}/gradcam")
+def get_patient_gradcam(request_id: str,
+                        _user: Optional[str] = Depends(require_user_if_enabled)) -> FileResponse:
+    return _patient_file(request_id, "gradcam_path", "image/png")
+
+
+@app.delete("/patients/{request_id}")
+def remove_patient(request_id: str,
+                   _user: Optional[str] = Depends(require_user_if_enabled)) -> dict:
+    if not delete_patient(request_id):
+        raise HTTPException(status_code=404, detail="Patient record not found.")
+    return {"deleted": request_id}
+
+
+@app.delete("/patients")
+def clear_patients(_user: Optional[str] = Depends(require_user_if_enabled)) -> dict:
+    init_patient_history()
+    for record in read_patients(limit=500):
+        delete_patient(record["request_id"])
+    return {"cleared": True}
 
 
 @app.exception_handler(Exception)
